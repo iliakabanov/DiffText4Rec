@@ -1,0 +1,35 @@
+data:
+  processed_dir: ./data/processed
+  padding_token_id: 11924  # уточнить!
+
+model:
+  d_emb: 1536               # text-embedding-3-small
+  d_cond: 512
+  encoder:
+    n_layers: 2
+    n_heads: 8
+    d_ff: 2048
+  denoiser:
+    n_blocks: 6
+    d_block: 1024
+    d_ff: 2048
+    d_modulation: 512
+    time_emb_dim: 256
+
+training:
+  batch_size: 256
+  lr: 1e-4
+  weight_decay: 0.01
+  warmup_steps: 1000
+  grad_clip: 1.0
+  num_steps: 100000
+  p_uncond: 0.1
+  ema_decay: 0.9999
+
+flow_matching:
+  tau_distribution: uniform
+  
+inference:
+  num_steps: 50
+  w_cfg: 1.0
+  top_k: [10, 20]
