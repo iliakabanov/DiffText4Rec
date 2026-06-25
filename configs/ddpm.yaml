@@ -1,0 +1,51 @@
+data:
+  data_dir: ./data/ATG
+  emb_path: ./data/ATG/3large_emb.pickle
+  whitening_cache: ./data/processed/whitening_cache.npz
+  padding_idx: 11924
+  n_components: 256
+  batch_size: 256
+  num_workers: 4
+  max_seq_len: 10
+
+encoder:
+  d_hidden: 512
+  d_cond: 512
+  layers: 2
+  heads: 8
+  d_ff: 2048
+  dropout: 0.1
+
+denoiser:
+  d_block: 512
+  d_ff: 1024
+  n_blocks: 6
+  time_emb_dim: 128
+  dropout: 0.0
+
+ddpm:
+  T: 1000                  # число шагов диффузии
+
+flow_matching:
+  p_uncond: 0.1
+  retrieval_metric: dot
+
+optimizer:
+  lr: 1e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  num_epochs: 300
+  warmup_epochs: 2
+
+ema:
+  decay: 0.9999
+
+eval:
+  every_epochs: 5
+  top_k: [10, 20]
+  num_sample_steps: 50     # DDIM шагов при сэмплировании
+  w_cfg: 1.0
+
+output:
+  dir: ./checkpoints
+  run_name: ddpm_baseline

@@ -1,45 +1,36 @@
 """
-ZCA-whitening для матрицы текстовых эмбеддингов товаров.
+PCA-проекция и нормализация эмбеддингов товаров для flow matching.
 
-Зачем нужно
------------
-TEM-эмбеддинги (OpenAI text-embedding-3-small) сильно анизотропны: они
-заполняют узкий конус в R^d, среднее далеко от нуля, ковариация не
-диагональная. Для conditional flow matching из N(0, I) это плохо — поток
-вынужден проходить через "пустую" часть пространства до того, как
-попасть на манифольд данных.
+Проблема с 3072d
+-----------------
+TEM-эмбеддинги (OpenAI text-embedding-3-large) имеют размерность 3072.
+Flow matching в 3072d требует огромного количества данных — на 15529
+sequences модель не может выучить распределение в таком пространстве.
 
-Whitening переводит эмбеддинги в пространство с нулевым средним и единичной
-ковариацией. После него N(0, I) — это естественный prior, поток проходит
-по прямой к данным, не теряя времени.
+Решение — PCA-проекция в n_components=256d:
+    1. Центрирование: e_c = e - mean(e).
+    2. PCA: берём топ-n_components главных компонент.
+    3. Проекция: e_pca = e_c @ V_top  (N, n_components).
+    4. Нормализация: e_norm = e_pca / scale.
 
-Решение — ZCA whitening:
-    W = U @ diag(1/sqrt(s + eps)) @ U.T,
-где U, s — из SVD(Sigma). Симметричное (W = W.T) и максимально близкое
-к identity, что сохраняет семантическую структуру эмбеддингов.
+После этого:
+    - Размерность: 3072 → 256 (в 12 раз меньше).
+    - mean ≈ 0, std ≈ 1.
+    - Row norm ≈ sqrt(n_components) ≈ 16  (вместо sqrt(3072) ≈ 55).
+    - Flow matching обучается в 256d — feasible на ~15k sequences.
 
-Альтернатива (PCA whitening) поворачивает координаты, что портит
-интерпретируемость dot-product retrieval'а.
+Retrieval делается в PCA-пространстве — эффективен потому что PCA
+максимизирует дисперсию и сохраняет ближайших соседей лучше чем
+случайная проекция.
 
-Использование
--------------
-Whitening параметры (mu, W) вычисляются один раз и хранятся как buffers
-внутри FlowMatcher — они автоматически попадают в state_dict при сохранении
-модели (source of truth).
+Хранение параметров
+-------------------
+Параметры (mu, V, scale) вычисляются один раз, хранятся как buffers
+в FlowMatcher (state_dict) и кэшируются на диск.
 
-Дополнительно есть save_whitening / load_whitening для кэширования на диск,
-чтобы не пересчитывать SVD при каждом первом создании модели (10-20s для
-матрицы 12000 x 3072). Кэш — это технический оптимизатор, а не source of truth.
-
-    # Первый запуск:
-    mu, W = compute_whitening(emb_raw)
-    save_whitening(cache_path, mu, W)
-
-    # Последующие запуски (если model state_dict ещё не существует):
-    mu, W = load_whitening(cache_path)
-
-    emb_whitened = apply_whitening(emb_raw, mu, W)
-    # дальше mu, W кладутся в model как register_buffer
+    mu, V, scale = compute_whitening(emb_raw, n_components=256)
+    emb_pca = apply_whitening(emb_raw, mu, V, scale)
+    # emb_pca shape: (N, 256)
 """
 
 from __future__ import annotations
@@ -51,41 +42,49 @@ import numpy as np
 
 
 # --------------------------------------------------------------------------- #
-# Core whitening
+# Core: PCA + normalization
 # --------------------------------------------------------------------------- #
 
 def compute_whitening(
     emb: np.ndarray,
+    n_components: int = 256,
     eps: float = 1e-8,
     exclude_indices: Iterable[int] | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+    verbose: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Вычисляет параметры ZCA-whitening: среднее mu и матрицу W.
+    Вычисляет параметры PCA-проекции и нормализации.
 
-    После применения:
-        e_white = (e - mu) @ W
-        mean(e_white) ≈ 0,  cov(e_white) ≈ I.
+    Преобразование:
+        e_pca  = (e - mu) @ V        # проекция в n_components-мерное пространство
+        e_norm = e_pca / scale       # нормализация std → 1
 
     Args:
-        emb:             (N, D) — матрица эмбеддингов.
-        eps:             регуляризация для устойчивости (добавляется к собств. значениям
-                         перед взятием обратного корня; защищает от деления на ~0
-                         в малозначимых направлениях).
-        exclude_indices: индексы строк, которые НЕ учитывать при вычислении статистик.
-                         Типичный случай — padding-token. Если None, используются все строки.
+        emb:          (N, D) — матрица эмбеддингов в исходном пространстве.
+        n_components: число главных компонент. По умолчанию 256.
+                      Рекомендуемые значения: 64, 128, 256, 512.
+        eps:          малая константа для численной стабильности scale.
+        exclude_indices: строки, не учитываемые при расчёте статистик.
+        verbose:      печатать диагностику.
 
     Returns:
-        mu: (D,)   — среднее, float64.
-        W:  (D, D) — whitening матрица, float64.
+        mu:    (D,)              — среднее в исходном пространстве.
+        V:     (D, n_components) — матрица главных компонент (PCA basis).
+        scale: (1,)              — глобальное std в PCA-пространстве.
 
     Notes:
-        - SVD считается через ковариационную матрицу (D, D), а не через сами данные —
-          это эффективнее при N >> D и численно стабильно для PSD матрицы.
-        - Возвращаемый dtype = float64. Конвертация в float32 при необходимости —
-          на стороне вызывающего кода (для GPU).
+        - SVD вычисляется через ковариационную матрицу (D, D) — это эффективно
+          когда N > D (наш случай: 11924 > 3072).
+        - V ортогональная: V.T @ V = I_{n_components}.
+        - Обратная проекция: e_orig ≈ e_pca @ V.T * scale + mu
+          (приближённая, т.к. PCA отбрасывает малые компоненты).
     """
     if emb.ndim != 2:
         raise ValueError(f'Expected 2D matrix, got shape {emb.shape}.')
+
+    D = emb.shape[1]
+    if n_components > D:
+        raise ValueError(f'n_components={n_components} > D={D}.')
 
     # Подмножество для статистик
     if exclude_indices is not None:
@@ -96,92 +95,99 @@ def compute_whitening(
     else:
         emb_for_stats = emb
 
-    if emb_for_stats.shape[0] < 2:
+    if emb_for_stats.shape[0] < n_components:
         raise ValueError(
-            f'Not enough rows for whitening: have {emb_for_stats.shape[0]} '
-            f'(need at least 2). Check exclude_indices.'
+            f'Not enough rows: have {emb_for_stats.shape[0]}, need at least {n_components}.'
         )
 
-    # Считаем в float64 для устойчивости SVD.
     emb_f64 = emb_for_stats.astype(np.float64, copy=False)
+    N = emb_f64.shape[0]
 
-    mu = emb_f64.mean(axis=0)                              # (D,)
-    centered = emb_f64 - mu                                # (N, D)
-    n = centered.shape[0]
-    # Ковариация без bias correction (как делают iDreamRec/AlphaFuse).
-    sigma = (centered.T @ centered) / n                    # (D, D)
+    # Шаг 1: центрирование
+    mu = emb_f64.mean(axis=0)                          # (D,)
+    centered = emb_f64 - mu                            # (N, D)
 
-    # SVD ковариационной матрицы. Для PSD матрицы svd ≡ eigendecomposition
-    # с неотрицательными собственными значениями, отсортированными по убыванию.
-    U, s, _ = np.linalg.svd(sigma)
+    # Шаг 2: SVD ковариационной матрицы → главные компоненты
+    sigma = (centered.T @ centered) / N                # (D, D)
+    U, s, _ = np.linalg.svd(sigma)                    # U: (D, D), s: (D,)
 
-    # ZCA whitening: W = U diag(1/sqrt(s + eps)) U^T
-    inv_sqrt = 1.0 / np.sqrt(s + eps)                      # (D,)
-    W = (U * inv_sqrt) @ U.T                               # (D, D)
+    # Топ-n_components главных компонент
+    V = U[:, :n_components]                            # (D, n_components)
 
-    return mu, W
+    # Шаг 3: проекция и нормализация
+    projected = centered @ V                           # (N, n_components)
+    scale = float(projected.std()) + eps               # скаляр
+
+    if verbose:
+        var_explained = s[:n_components].sum() / s.sum() * 100
+        print(f'  PCA: {D}d → {n_components}d')
+        print(f'  Variance explained: {var_explained:.1f}%')
+        print(f'  scale: {scale:.6f}')
+        emb_norm = projected / scale
+        print(f'  After projection: mean={emb_norm.mean():.6f}, std={emb_norm.std():.6f}')
+        print(f'  Row norm mean: {np.linalg.norm(emb_norm, axis=1).mean():.4f}')
+        print(f'    (expected ~{n_components**0.5:.1f} for N(0,1) in {n_components}d)')
+
+    return mu, V, np.array([scale])
 
 
 def apply_whitening(
     emb: np.ndarray,
     mu: np.ndarray,
-    W: np.ndarray,
+    V: np.ndarray,
+    scale: np.ndarray,
 ) -> np.ndarray:
     """
-    Применяет whitening к матрице эмбеддингов:
-        e_white = (e - mu) @ W.
+    Применяет PCA-проекцию и нормализацию:
+        e_pca  = (e - mu) @ V
+        e_norm = e_pca / scale
 
     Args:
-        emb: (N, D) или (D,).
-        mu:  (D,)
-        W:   (D, D)
+        emb:   (N, D) или (D,) — исходные эмбеддинги.
+        mu:    (D,)             — среднее.
+        V:     (D, n_components) — PCA basis.
+        scale: (1,)             — масштаб.
 
     Returns:
-        Эмбеддинги той же формы и dtype, что и emb (сохраняется dtype входа).
-
-    Notes:
-        - Если emb во float32, операция тоже идёт во float32; ZCA достаточно
-          устойчив, чтобы это не вызывало проблем.
-        - Применяется ко ВСЕМ строкам, включая те, что были исключены при
-          compute_whitening. Это сознательно: padding-token (если он был
-          исключён) после whitening превратится из нулей в (0 - mu) @ W,
-          который, скорее всего, окажется на типичной норме whitened данных.
-          Чтобы padding оставался нулевым, обнуляйте его строку явно после
-          whitening (это делается в encoder'е через nn.Embedding).
+        (N, n_components) или (n_components,) — нормализованные эмбеддинги.
+        dtype: float32.
     """
-    input_dtype = emb.dtype
-    e = emb.astype(np.float32, copy=False) if input_dtype != np.float64 else emb
-    mu_ = mu.astype(e.dtype, copy=False)
-    W_ = W.astype(e.dtype, copy=False)
-
-    result = (e - mu_) @ W_
-    return result.astype(input_dtype, copy=False)
+    s = float(scale.flat[0])
+    e = emb.astype(np.float64, copy=False)
+    mu_ = mu.astype(np.float64, copy=False)
+    V_ = V.astype(np.float64, copy=False)
+    result = ((e - mu_) @ V_) / s
+    return result.astype(np.float32)
 
 
 def inverse_whitening(
     z: np.ndarray,
     mu: np.ndarray,
-    W: np.ndarray,
+    V: np.ndarray,
+    scale: np.ndarray,
 ) -> np.ndarray:
     """
-    Обратное преобразование: z @ W^{-1} + mu.
+    Приближённое обратное преобразование:
+        e_approx = z * scale @ V.T + mu
 
-    Полезно для отладки и интерпретации сгенерированных эмбеддингов.
-    В training/inference пайплайне не используется.
+    Приближённое, так как PCA отбрасывает малые компоненты.
+    Используется только для интерпретации, не для retrieval.
 
     Args:
-        z:  (N, D) или (D,).
-        mu: (D,)
-        W:  (D, D)
+        z:     (N, n_components) или (n_components,)
+        mu:    (D,)
+        V:     (D, n_components)
+        scale: (1,)
 
     Returns:
-        Эмбеддинги той же формы и dtype, что и z.
+        (N, D) — эмбеддинги в исходном пространстве, float32.
     """
-    input_dtype = z.dtype
+    s = float(scale.flat[0])
     z_f = z.astype(np.float64, copy=False)
-    W_inv = np.linalg.inv(W.astype(np.float64, copy=False))
-    e = z_f @ W_inv + mu.astype(np.float64)
-    return e.astype(input_dtype, copy=False)
+    V_ = V.astype(np.float64, copy=False)
+    mu_ = mu.astype(np.float64, copy=False)
+    result = (z_f * s) @ V_.T + mu_
+    return result.astype(np.float32)
 
 
 # --------------------------------------------------------------------------- #
@@ -193,26 +199,14 @@ def verify_whitening(
     exclude_indices: Iterable[int] | None = None,
 ) -> dict[str, float]:
     """
-    Sanity check: вычисляет фактические среднее и ковариацию whitened-эмбеддингов.
-    Идеальный результат:
-        mean_abs_max ≈ 0
-        cov_diag_mean ≈ 1
-        cov_offdiag_abs_mean ≈ 0
+    Sanity check на PCA-нормализованных эмбеддингах.
 
     Args:
-        emb_whitened:    (N, D) — whitened эмбеддинги.
-        exclude_indices: какие строки исключать (по умолчанию те же, что и при
-                         compute_whitening — обычно padding).
+        emb_whitened: (N, n_components) — нормализованные эмбеддинги.
+        exclude_indices: строки для исключения.
 
     Returns:
-        dict с метриками:
-            'mean_abs_max':         max(|mean per dim|)        — должен быть ~0
-            'mean_abs_mean':        mean(|mean per dim|)       — должен быть ~0
-            'cov_diag_mean':        среднее по диагонали cov   — должно быть ~1
-            'cov_diag_std':         std по диагонали cov       — должен быть ~0
-            'cov_offdiag_abs_mean': mean(|off-diagonal|) cov   — должен быть ~0
-            'cov_offdiag_abs_max':  max(|off-diagonal|) cov    — должен быть ~0
-            'frobenius_dist_to_I':  ||cov - I||_F              — должен быть ~0
+        dict: {'mean_abs_max', 'std_mean', 'row_norm_mean', 'row_norm_std'}
     """
     if exclude_indices is not None:
         exclude = np.asarray(list(exclude_indices), dtype=np.int64)
@@ -223,43 +217,38 @@ def verify_whitening(
         emb = emb_whitened
 
     emb = emb.astype(np.float64, copy=False)
-    n, d = emb.shape
-
-    mean = emb.mean(axis=0)                                # (D,)
-    centered = emb - mean
-    cov = (centered.T @ centered) / n                      # (D, D)
-
-    diag = np.diag(cov)
-    # Off-diagonal: маска через identity.
-    offdiag_mask = ~np.eye(d, dtype=bool)
-    offdiag = cov[offdiag_mask]
+    mean = emb.mean(axis=0)
+    n_components = emb.shape[1]
 
     return {
-        'mean_abs_max':         float(np.abs(mean).max()),
-        'mean_abs_mean':        float(np.abs(mean).mean()),
-        'cov_diag_mean':        float(diag.mean()),
-        'cov_diag_std':         float(diag.std()),
-        'cov_offdiag_abs_mean': float(np.abs(offdiag).mean()),
-        'cov_offdiag_abs_max':  float(np.abs(offdiag).max()),
-        'frobenius_dist_to_I':  float(np.linalg.norm(cov - np.eye(d))),
+        'mean_abs_max':  float(np.abs(mean).max()),
+        'std_mean':      float(emb.std(axis=0).mean()),
+        'row_norm_mean': float(np.linalg.norm(emb, axis=1).mean()),
+        'row_norm_std':  float(np.linalg.norm(emb, axis=1).std()),
+        'expected_norm': float(n_components ** 0.5),
     }
 
 
 # --------------------------------------------------------------------------- #
-# I/O (для дискового кэша; source of truth — state_dict модели)
+# I/O (дисковый кэш; source of truth — state_dict модели)
 # --------------------------------------------------------------------------- #
 
-def save_whitening(path: str | Path, mu: np.ndarray, W: np.ndarray) -> None:
-    """Кэширует параметры whitening в .npz, чтобы не пересчитывать SVD."""
+def save_whitening(
+    path: str | Path,
+    mu: np.ndarray,
+    V: np.ndarray,
+    scale: np.ndarray,
+) -> None:
+    """Сохраняет PCA-параметры в .npz."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(path, mu=mu, W=W)
+    np.savez(path, mu=mu, V=V, scale=scale)
 
 
-def load_whitening(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
-    """Загружает кэш параметров whitening из .npz."""
+def load_whitening(path: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Загружает PCA-параметры из .npz."""
     data = np.load(path)
-    return data['mu'], data['W']
+    return data['mu'], data['V'], data['scale']
 
 
 # --------------------------------------------------------------------------- #
@@ -268,38 +257,75 @@ def load_whitening(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
 
 if __name__ == '__main__':
     """
-    Sanity check на синтетических данных:
-        python -m src.whitening
+    python -m src.whitening
     """
+    import sys
     rng = np.random.default_rng(42)
-    N, D = 1000, 64
 
-    # Генерируем анизотропные данные: смещённое среднее + неединичная ковариация.
-    A = rng.standard_normal((D, D))
-    cov_target = A @ A.T / D                                # PSD
-    L = np.linalg.cholesky(cov_target)
-    base = rng.standard_normal((N, D))
-    emb = base @ L.T + rng.standard_normal(D) * 3.0         # смещаем
-    emb = emb.astype(np.float32)
+    # Симулируем L2-нормированные эмбеддинги как у OpenAI (N=500, D=128)
+    N, D, K = 500, 128, 32
+    emb = rng.standard_normal((N, D)).astype(np.float32)
+    emb /= np.linalg.norm(emb, axis=1, keepdims=True)
 
-    print(f'Input emb: shape={emb.shape}, dtype={emb.dtype}')
-    print(f'  Input mean abs max: {np.abs(emb.mean(axis=0)).max():.4f}')
-    print(f'  Input cov diag mean: {np.cov(emb, rowvar=False).diagonal().mean():.4f}')
+    print(f'Input: shape={emb.shape}, L2 norm={np.linalg.norm(emb, axis=1).mean():.4f}')
 
-    mu, W = compute_whitening(emb)
-    print(f'\nComputed: mu shape={mu.shape}, W shape={W.shape}')
+    # Test 1: compute_whitening
+    print('\nTest 1: compute_whitening')
+    mu, V, scale = compute_whitening(emb, n_components=K, verbose=True)
+    assert mu.shape == (D,)
+    assert V.shape == (D, K)
+    assert scale.shape == (1,)
+    assert abs(float(scale.flat[0])) > 0
+    # V должна быть ортогональной
+    VtV = V.T @ V
+    assert np.allclose(VtV, np.eye(K), atol=1e-6), 'V not orthogonal'
+    print(f'  mu: {mu.shape}, V: {V.shape}, scale: {scale}')
+    print(f'  V orthogonality: ||V.T @ V - I||_F = {np.linalg.norm(VtV - np.eye(K)):.2e}  OK')
 
-    emb_w = apply_whitening(emb, mu, W)
-    print(f'Whitened: shape={emb_w.shape}, dtype={emb_w.dtype}')
+    # Test 2: apply_whitening
+    print('\nTest 2: apply_whitening')
+    emb_pca = apply_whitening(emb, mu, V, scale)
+    assert emb_pca.shape == (N, K)
+    assert emb_pca.dtype == np.float32
+    stats = verify_whitening(emb_pca)
+    print(f'  Output shape: {emb_pca.shape}')
+    print(f'  mean_abs_max:  {stats["mean_abs_max"]:.6f}  (should be ~0)')
+    print(f'  std_mean:      {stats["std_mean"]:.6f}  (should be ~1)')
+    print(f'  row_norm_mean: {stats["row_norm_mean"]:.4f}  (expected ~{stats["expected_norm"]:.2f})')
+    assert stats['mean_abs_max'] < 0.1
+    assert 0.9 < stats['std_mean'] < 1.1
+    print('  OK')
 
-    stats = verify_whitening(emb_w)
-    print(f'\nVerification:')
-    for k, v in stats.items():
-        print(f'  {k:25s} {v:+.6f}')
+    # Test 3: inverse_whitening (приближённое)
+    print('\nTest 3: inverse_whitening (approximate)')
+    emb_back = inverse_whitening(emb_pca, mu, V, scale)
+    assert emb_back.shape == (N, D)
+    # Точность зависит от variance explained — чем меньше K, тем хуже
+    max_err = np.abs(emb.astype(np.float64) - emb_back.astype(np.float64)).max()
+    print(f'  Max reconstruction error: {max_err:.4f}  (approximate — OK)')
 
-    # Round-trip
-    emb_back = inverse_whitening(emb_w, mu, W)
-    max_err = np.abs(emb - emb_back).max()
-    print(f'\nRound-trip max error: {max_err:.6e}')
-    assert max_err < 1e-4, 'Round-trip should be near-exact'
-    print('Round-trip OK')
+    # Test 4: save/load round-trip
+    print('\nTest 4: save/load')
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / 'subdir' / 'wh.npz'
+        save_whitening(path, mu, V, scale)
+        mu2, V2, scale2 = load_whitening(path)
+        np.testing.assert_array_equal(mu, mu2)
+        np.testing.assert_array_equal(V, V2)
+        np.testing.assert_array_equal(scale, scale2)
+    print('  Exact round-trip  OK')
+
+    # Test 5: совместимость с реалистичными данными (11924 x 3072 → 256)
+    print('\nTest 5: realistic scale (simulated 1000 x 512 → 64)')
+    N2, D2, K2 = 1000, 512, 64
+    emb2 = rng.standard_normal((N2, D2)).astype(np.float32)
+    emb2 /= np.linalg.norm(emb2, axis=1, keepdims=True)
+    mu2, V2, scale2 = compute_whitening(emb2, n_components=K2, verbose=True)
+    emb2_pca = apply_whitening(emb2, mu2, V2, scale2)
+    stats2 = verify_whitening(emb2_pca)
+    print(f'  row_norm_mean={stats2["row_norm_mean"]:.4f} (expected ~{K2**0.5:.1f})')
+    assert 0.9 < stats2['std_mean'] < 1.1
+    print('  OK')
+
+    print('\nAll checks passed')

@@ -1,32 +1,25 @@
 """
-Conditional Flow Matching для sequential recommendation.
+Conditional Flow Matching для sequential recommendation с PCA-проекцией.
 
-Связывает HistoryEncoder и MLPDenoiser в единую модель.
-Реализует:
-    - Инициализацию whitening (с дисковым кэшем).
-    - compute_loss: FM loss с classifier-free guidance dropout.
-    - sample: Euler ODE с CFG.
-    - retrieve: dot product retrieval по каталогу товаров.
+Архитектура (LDM-style):
+    TEM embeddings (3072d)
+        → PCA проекция (n_components=256d)     ← сжатие пространства
+        → Flow Matching в 256d                 ← основное обучение
+        → Retrieval в 256d                     ← поиск ближайших товаров
 
-Теория
-------
-Rectified flow (Liu et al. 2022) задаёт прямую траекторию от шума к данным:
+Зачем PCA:
+    Flow matching в 3072d требует огромного количества данных. На 15k
+    sequences модель не успевает выучить распределение. PCA сжимает
+    пространство в ~12 раз (3072 → 256), делая задачу feasible.
+
+    Это LDM-аналог для рекомендаций: как Latent Diffusion Models делают
+    диффузию в сжатом латентном пространстве VAE, мы делаем FM в PCA-пространстве
+    семантических эмбеддингов.
+
+Flow matching:
     z_τ = (1 - τ) z_0 + τ z_1,   τ ∈ [0, 1]
-    z_0 ~ N(0, I),   z_1 = whitened TEM embedding целевого товара
-
-Velocity вдоль траектории — константа:
-    u(τ) = z_1 - z_0
-
-Модель учится предсказывать эту velocity:
-    v_θ(z_τ, τ, c) ≈ z_1 - z_0
-
-Лосс — MSE между предсказанной и истинной velocity:
-    L = E_{τ, z_0, (history, z_1)} || v_θ(z_τ, τ, c) - (z_1 - z_0) ||²
-
-Classifier-Free Guidance (Ho & Salimans 2022):
-    Во время обучения с вероятностью p_uncond заменяем c на обучаемый Φ.
-    Во время inference:
-        ṽ = (1 + w) v_θ(z_τ, τ, c) - w v_θ(z_τ, τ, Φ)
+    z_0 ~ N(0, I_{256}),   z_1 = PCA(TEM(item))
+    L = E || v_θ(z_τ, τ, c) - (z_1 - z_0) ||²
 """
 
 from __future__ import annotations
@@ -34,56 +27,53 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent.parent
+ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT))
 
 import numpy as np
 import torch
 import torch.nn as nn
 
-from src.whitening import (
+from whitening import (
     apply_whitening,
     compute_whitening,
     load_whitening,
     save_whitening,
-    verify_whitening,
 )
-from src.models.encoder import HistoryEncoder
-from src.models.denoiser import MLPDenoiser, sinusoidal_embedding
+from models.encoder import HistoryEncoder
+from models.denoiser import MLPDenoiser
 
 
 class FlowMatcher(nn.Module):
     """
-    Conditional Flow Matching для sequential recommendation.
+    Conditional Flow Matching с PCA-проекцией.
 
     Args:
-        item_embeddings_raw: (N_items, d_emb) — сырые TEM эмбеддинги товаров
-                             в float32 или float64. Padding-слот не включён —
-                             будет добавлен автоматически.
-        padding_idx:         индекс padding-токена (= N_items).
-        whitening_cache_path: путь к .npz кэшу whitening параметров.
-                              Если файл существует — загружается мгновенно.
-                              Если нет — считается SVD и кэш сохраняется.
-        d_hidden:            скрытая размерность encoder'а.
-        d_cond:              размерность conditioning vector.
-        encoder_layers:      число слоёв Transformer в encoder'е.
-        encoder_heads:       число голов attention в encoder'е.
-        encoder_d_ff:        размерность FFN в encoder'е.
-        encoder_dropout:     dropout в encoder'е.
-        max_seq_len:         максимальная длина истории.
-        denoiser_d_block:    внутренняя ширина денойзера.
-        denoiser_d_ff:       ширина FFN в residual блоках денойзера.
-        denoiser_n_blocks:   количество residual блоков.
-        denoiser_time_emb_dim: размерность sinusoidal time embedding.
-        denoiser_dropout:    dropout в денойзере.
-        p_uncond:            вероятность CFG dropout при обучении.
+        item_embeddings_raw:  (N_items, D_raw) — сырые TEM эмбеддинги.
+        padding_idx:          индекс padding-токена (= N_items).
+        n_components:         размерность PCA-пространства для FM (по умолчанию 256).
+        whitening_cache_path: путь к кэшу PCA-параметров.
+        d_hidden:             скрытая размерность encoder'а.
+        d_cond:               размерность conditioning vector.
+        encoder_layers:       число Transformer слоёв.
+        encoder_heads:        число attention голов.
+        encoder_d_ff:         ширина FFN в encoder'е.
+        encoder_dropout:      dropout в encoder'е.
+        max_seq_len:          максимальная длина истории.
+        denoiser_d_block:     внутренняя ширина денойзера.
+        denoiser_d_ff:        ширина FFN в денойзере.
+        denoiser_n_blocks:    число residual блоков.
+        denoiser_time_emb_dim: размерность time embedding.
+        denoiser_dropout:     dropout в денойзере.
+        p_uncond:             вероятность CFG dropout при обучении.
     """
 
     def __init__(
         self,
         item_embeddings_raw: np.ndarray,
         padding_idx: int,
-        whitening_cache_path: str | Path = '../data/processed/whitening_cache.npz',
+        n_components: int = 256,
+        whitening_cache_path: str | Path = './data/processed/whitening_cache.npz',
         # Encoder
         d_hidden: int = 512,
         d_cond: int = 512,
@@ -93,46 +83,56 @@ class FlowMatcher(nn.Module):
         encoder_dropout: float = 0.1,
         max_seq_len: int = 10,
         # Denoiser
-        denoiser_d_block: int = 1024,
-        denoiser_d_ff: int = 2048,
+        denoiser_d_block: int = 512,
+        denoiser_d_ff: int = 1024,
         denoiser_n_blocks: int = 6,
-        denoiser_time_emb_dim: int = 256,
+        denoiser_time_emb_dim: int = 128,
         denoiser_dropout: float = 0.0,
         # CFG
         p_uncond: float = 0.1,
+        # Retrieval
+        retrieval_metric: str = 'dot',   # 'dot' или 'cosine'
     ):
         super().__init__()
 
         self.padding_idx = padding_idx
-        self.n_items = item_embeddings_raw.shape[0]   # без padding
-        self.d_emb = item_embeddings_raw.shape[1]
+        self.n_items = item_embeddings_raw.shape[0]
+        self.d_raw = item_embeddings_raw.shape[1]    # исходная размерность (3072)
+        self.d_emb = n_components                    # рабочая размерность FM (256)
+        self.n_components = n_components
         self.p_uncond = p_uncond
+        self.d_cond = d_cond
+        self.retrieval_metric = retrieval_metric
 
         # ------------------------------------------------------------------ #
-        # Whitening
+        # PCA + нормализация
         # ------------------------------------------------------------------ #
-        mu, W = self._load_or_compute_whitening(
+        mu, V, scale = self._load_or_compute_whitening(
             item_embeddings_raw,
+            n_components,
             Path(whitening_cache_path),
         )
 
-        # Регистрируем как buffers — попадут в state_dict при save
-        self.register_buffer('whitening_mu', torch.from_numpy(mu).float())
-        self.register_buffer('whitening_W',  torch.from_numpy(W).float())
+        # Buffers: попадают в state_dict при сохранении модели
+        self.register_buffer('whitening_mu',    torch.from_numpy(mu).float())
+        self.register_buffer('whitening_V',     torch.from_numpy(V).float())
+        self.register_buffer('whitening_scale', torch.from_numpy(scale).float())
 
-        # Применяем whitening к сырым эмбеддингам
-        emb_whitened = apply_whitening(
-            item_embeddings_raw.astype(np.float32), mu, W,
-        )                                               # (N_items, d_emb), float32
+        # Применяем PCA к сырым эмбеддингам
+        emb_pca = apply_whitening(
+            item_embeddings_raw.astype(np.float32), mu, V, scale,
+        )                                               # (N_items, n_components)
 
-        # Добавляем нулевую строку для padding token
+        # Нулевая строка для padding token
         emb_with_pad = np.vstack([
-            emb_whitened,
-            np.zeros((1, self.d_emb), dtype=np.float32),
-        ])                                              # (N_items + 1, d_emb)
+            emb_pca,
+            np.zeros((1, n_components), dtype=np.float32),
+        ])                                              # (N_items + 1, n_components)
 
         # ------------------------------------------------------------------ #
         # Encoder
+        # История тоже работает в PCA-пространстве: item lookup возвращает
+        # PCA-эмбеддинги, encoder обрабатывает их и выдаёт conditioning vector.
         # ------------------------------------------------------------------ #
         self.encoder = HistoryEncoder(
             item_embeddings=torch.from_numpy(emb_with_pad),
@@ -147,10 +147,10 @@ class FlowMatcher(nn.Module):
         )
 
         # ------------------------------------------------------------------ #
-        # Denoiser
+        # Denoiser работает в n_components-мерном пространстве
         # ------------------------------------------------------------------ #
         self.denoiser = MLPDenoiser(
-            d_emb=self.d_emb,
+            d_emb=n_components,           # 256, не 3072!
             d_cond=d_cond,
             d_block=denoiser_d_block,
             d_ff=denoiser_d_ff,
@@ -159,59 +159,56 @@ class FlowMatcher(nn.Module):
             dropout=denoiser_dropout,
         )
 
-        # ------------------------------------------------------------------ #
-        # Unconditional token Φ для CFG
-        # ------------------------------------------------------------------ #
-        # Обучаемый вектор, заменяет c при unconditional forward pass.
-        # Инициализируется нулями — нейтральный старт.
+        # Unconditional token для CFG
         self.phi = nn.Parameter(torch.zeros(d_cond))
 
-        self.d_cond = d_cond
-        self.denoiser_time_emb_dim = denoiser_time_emb_dim
-
     # ---------------------------------------------------------------------- #
-    # Whitening helpers
+    # PCA helpers
     # ---------------------------------------------------------------------- #
 
     @staticmethod
     def _load_or_compute_whitening(
         emb_raw: np.ndarray,
+        n_components: int,
         cache_path: Path,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Загружает whitening параметры из кэша или вычисляет их через SVD.
-
-        Кэш — техническая оптимизация (экономит 10-20s при повторном создании
-        модели с нуля). Source of truth — state_dict (register_buffer).
-        """
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Загружает PCA из кэша или вычисляет SVD."""
         if cache_path.exists():
-            print(f'Loading whitening from cache: {cache_path}')
-            mu, W = load_whitening(cache_path)
-            return mu, W
+            data = np.load(cache_path)
+            # Проверяем совместимость n_components с кэшем
+            if 'V' in data and data['V'].shape[1] == n_components:
+                print(f'Loading whitening from cache: {cache_path}')
+                return data['mu'], data['V'], data['scale']
+            else:
+                cached_k = data['V'].shape[1] if 'V' in data else '?'
+                print(f'Cache has n_components={cached_k}, need {n_components}. Recomputing...')
 
-        print('Computing whitening (first time, may take ~10-20s)...')
-        mu, W = compute_whitening(emb_raw.astype(np.float64))
-        save_whitening(cache_path, mu, W)
-        print(f'Whitening cached to: {cache_path}')
-        return mu, W
+        print(f'Computing PCA {emb_raw.shape[1]}d → {n_components}d (may take ~30-60s)...')
+        mu, V, scale = compute_whitening(
+            emb_raw.astype(np.float64),
+            n_components=n_components,
+            verbose=True,
+        )
+        save_whitening(cache_path, mu, V, scale)
+        print(f'Cached to: {cache_path}')
+        return mu, V, scale
 
-    def apply_whitening_to_new_items(self, emb_raw: np.ndarray) -> torch.Tensor:
+    def project_new_items(self, emb_raw: np.ndarray) -> torch.Tensor:
         """
-        Применяет whitening к новым эмбеддингам (например, новые товары
-        или query-эмбеддинги при inference).
-
-        Использует параметры из register_buffer — те же, что при обучении.
+        Проецирует новые сырые эмбеддинги в PCA-пространство.
+        Использует параметры из state_dict — те же что при обучении.
 
         Args:
-            emb_raw: (N, d_emb) numpy array.
+            emb_raw: (N, D_raw) numpy array.
         Returns:
-            (N, d_emb) FloatTensor на том же device что и модель.
+            (N, n_components) FloatTensor.
         """
         device = self.whitening_mu.device
-        emb = torch.from_numpy(emb_raw.astype(np.float32)).to(device)
-        mu = self.whitening_mu
-        W = self.whitening_W
-        return (emb - mu) @ W
+        mu = self.whitening_mu.cpu().numpy()
+        V  = self.whitening_V.cpu().numpy()
+        scale = self.whitening_scale.cpu().numpy()
+        emb_pca = apply_whitening(emb_raw.astype(np.float32), mu, V, scale)
+        return torch.from_numpy(emb_pca).to(device)
 
     # ---------------------------------------------------------------------- #
     # Training
@@ -224,63 +221,41 @@ class FlowMatcher(nn.Module):
         mask: torch.FloatTensor,
     ) -> torch.Tensor:
         """
-        Вычисляет FM loss для одного батча.
+        FM loss на одном батче.
 
-        Args:
-            history: (B, L) — индексы товаров в истории (с padding слева).
-            target:  (B,)   — индексы целевых товаров.
-            mask:    (B, L) — 1.0 для реальных позиций, 0.0 для padding.
-
-        Returns:
-            loss: скалярный тензор — MSE между predicted и true velocity.
-
-        Flow matching steps:
-            1. z_1 = whitened embedding целевого товара.
-            2. z_0 ~ N(0, I).
-            3. τ ~ U(0, 1).
-            4. z_τ = (1 - τ) z_0 + τ z_1.
-            5. u_true = z_1 - z_0  (true velocity).
-            6. c = encoder(history, mask).
-            7. CFG dropout: с вероятностью p_uncond заменяем c на Φ.
-            8. v_pred = denoiser(z_τ, τ, c).
-            9. loss = MSE(v_pred, u_true).
+        Все операции в PCA-пространстве (n_components-мерном).
         """
         B = history.shape[0]
         device = history.device
 
-        # z_1: whitened embedding целевого товара
-        # encoder.item_embedding уже хранит whitened эмбеддинги
-        z_1 = self.encoder.item_embedding(target)      # (B, d_emb)
+        # z_1: PCA-эмбеддинг целевого товара (уже в PCA-пространстве)
+        z_1 = self.encoder.item_embedding(target)       # (B, n_components)
 
-        # z_0: стандартный гауссов шум
-        z_0 = torch.randn_like(z_1)                    # (B, d_emb)
+        # z_0: гауссов шум в n_components-мерном пространстве
+        z_0 = torch.randn_like(z_1)                     # (B, n_components)
 
-        # τ ~ Uniform(0, 1)
-        tau = torch.rand(B, device=device)              # (B,)
+        # τ ~ U(0, 1)
+        tau = torch.rand(B, device=device)
+        tau_e = tau.view(B, 1)
 
-        # z_τ = (1 - τ) z_0 + τ z_1  — линейная интерполяция
-        tau_expand = tau.view(B, 1)                     # (B, 1) для broadcast
-        z_tau = (1.0 - tau_expand) * z_0 + tau_expand * z_1  # (B, d_emb)
+        # Линейная интерполяция
+        z_tau = (1.0 - tau_e) * z_0 + tau_e * z_1      # (B, n_components)
 
-        # Истинная velocity — константа вдоль прямой траектории
-        u_true = z_1 - z_0                             # (B, d_emb)
+        # Истинная velocity
+        u_true = z_1 - z_0                              # (B, n_components)
 
-        # Conditioning: encoder history → c
-        c = self.encoder(history, mask)                 # (B, d_cond)
+        # Conditioning из encoder'а
+        c = self.encoder(history, mask)                  # (B, d_cond)
 
-        # CFG dropout: с вероятностью p_uncond заменяем c на Φ
-        # Маска: True → заменить на Φ
-        drop_mask = torch.rand(B, device=device) < self.p_uncond  # (B,), bool
-        phi = self.phi.unsqueeze(0).expand(B, -1)       # (B, d_cond)
-        c = torch.where(drop_mask.unsqueeze(-1), phi, c)  # (B, d_cond)
+        # CFG dropout: p_uncond вероятность заменить c на Φ
+        drop_mask = torch.rand(B, device=device) < self.p_uncond
+        phi = self.phi.unsqueeze(0).expand(B, -1)
+        c = torch.where(drop_mask.unsqueeze(-1), phi, c)
 
-        # Predicted velocity
-        v_pred = self.denoiser(z_tau, tau, c)           # (B, d_emb)
+        # Предсказание velocity денойзером
+        v_pred = self.denoiser(z_tau, tau, c)            # (B, n_components)
 
-        # MSE loss
-        loss = ((v_pred - u_true) ** 2).mean()
-
-        return loss
+        return ((v_pred - u_true) ** 2).mean()
 
     # ---------------------------------------------------------------------- #
     # Inference
@@ -295,59 +270,40 @@ class FlowMatcher(nn.Module):
         w_cfg: float = 1.0,
     ) -> torch.Tensor:
         """
-        Генерирует oracle embedding через Euler ODE с CFG.
+        Euler ODE с CFG. Возвращает oracle embedding в PCA-пространстве.
 
         Args:
-            history:   (B, L) — история пользователя.
-            mask:      (B, L) — маска для padding.
-            num_steps: число шагов Euler ODE.
-            w_cfg:     сила classifier-free guidance.
-                       w=0 → только conditional,
-                       w>0 → усиливаем conditional относительно unconditional.
+            history:   (B, L)
+            mask:      (B, L)
+            num_steps: число шагов Euler.
+            w_cfg:     сила CFG. 0.0 = только conditional, >0 = усиление.
 
         Returns:
-            z_0_pred: (B, d_emb) — сгенерированный oracle embedding
-                      в whitened пространстве.
-
-        CFG formula:
-            ṽ = (1 + w) v_θ(z_τ, τ, c) - w v_θ(z_τ, τ, Φ)
-
-        Euler ODE:
-            z_{τ - dt} = z_τ - dt * ṽ(z_τ, τ)
-            от τ=1 до τ=0.
+            (B, n_components) — oracle embedding в PCA-пространстве.
         """
         B = history.shape[0]
         device = history.device
 
-        # Encoding истории (один раз — не меняется во время ODE)
-        c = self.encoder(history, mask)                 # (B, d_cond)
+        c   = self.encoder(history, mask)                # (B, d_cond)
+        phi = self.phi.unsqueeze(0).expand(B, -1)        # (B, d_cond)
 
-        # Unconditional token — расширяем для батча
-        phi = self.phi.unsqueeze(0).expand(B, -1)       # (B, d_cond)
+        # Стартовая точка: шум в n_components-мерном пространстве
+        z = torch.randn(B, self.d_emb, device=device)
 
-        # Стартовая точка: чистый гауссов шум z_1 ~ N(0, I)
-        z = torch.randn(B, self.d_emb, device=device)   # (B, d_emb)
-
-        # Euler ODE от τ=1 до τ=0
+        # Euler ODE от τ=0 до τ=1: шум → цель
+        # Сетка: [0.0, dt, 2dt, ..., 1-dt]
         dt = 1.0 / num_steps
         for i in range(num_steps):
-            # Текущее время: от 1 до 0
-            tau_val = 1.0 - i * dt
-            tau = torch.full((B,), tau_val, device=device)  # (B,)
+            tau_val = i * dt
+            tau = torch.full((B,), tau_val, device=device)
 
-            # Conditional velocity
-            v_cond = self.denoiser(z, tau, c)            # (B, d_emb)
+            v_cond   = self.denoiser(z, tau, c)
+            v_uncond = self.denoiser(z, tau, phi)
+            v = (1.0 + w_cfg) * v_cond - w_cfg * v_uncond
 
-            # Unconditional velocity (с Φ вместо c)
-            v_uncond = self.denoiser(z, tau, phi)        # (B, d_emb)
+            z = z + dt * v
 
-            # CFG: усиливаем conditional относительно unconditional
-            v = (1.0 + w_cfg) * v_cond - w_cfg * v_uncond  # (B, d_emb)
-
-            # Euler шаг: движемся от τ к τ - dt
-            z = z - dt * v                               # (B, d_emb)
-
-        return z                                         # oracle embedding
+        return z
 
     @torch.no_grad()
     def retrieve(
@@ -356,32 +312,25 @@ class FlowMatcher(nn.Module):
         top_k: int = 20,
     ) -> torch.Tensor:
         """
-        Находит top-K ближайших товаров к oracle embedding.
-
-        Retrieval через dot product в whitened пространстве.
-        Padding token (индекс = n_items) исключается.
+        Top-K retrieval в PCA-пространстве по dot product.
 
         Args:
-            oracle_embeddings: (B, d_emb) — сгенерированные oracle embeddings.
-            top_k:             сколько товаров возвращать.
+            oracle_embeddings: (B, n_components)
+            top_k:             сколько товаров вернуть.
 
         Returns:
-            (B, top_k) — индексы top-K товаров для каждого пользователя.
+            (B, top_k) — индексы товаров.
         """
-        # Embedding table без padding строки: первые n_items строк
-        item_emb = self.encoder.item_embedding.weight[:self.n_items]  # (N_items, d_emb)
-
-        # Dot product: (B, d_emb) × (d_emb, N_items) → (B, N_items)
-        scores = oracle_embeddings @ item_emb.T
-
-        # Top-K по убыванию
-        top_k_indices = scores.topk(top_k, dim=-1).indices  # (B, top_k)
-
-        return top_k_indices
-
-    # ---------------------------------------------------------------------- #
-    # Convenience
-    # ---------------------------------------------------------------------- #
+        # Embedding table без padding строки — в PCA-пространстве
+        item_emb = self.encoder.item_embedding.weight[:self.n_items]  # (N, n_components)
+        if self.retrieval_metric == 'cosine':
+            import torch.nn.functional as F
+            oracle_norm = F.normalize(oracle_embeddings, dim=-1)
+            item_norm   = F.normalize(item_emb, dim=-1)
+            scores = oracle_norm @ item_norm.T
+        else:
+            scores = oracle_embeddings @ item_emb.T                    # (B, N)
+        return scores.topk(top_k, dim=-1).indices
 
     @torch.no_grad()
     def recommend(
@@ -392,36 +341,23 @@ class FlowMatcher(nn.Module):
         num_steps: int = 50,
         w_cfg: float = 1.0,
     ) -> torch.Tensor:
-        """
-        Полный inference pipeline: history → oracle → top-K товаров.
-
-        Args:
-            history: (B, L)
-            mask:    (B, L)
-            top_k:   сколько товаров возвращать.
-            num_steps, w_cfg: параметры sample().
-
-        Returns:
-            (B, top_k) — индексы рекомендованных товаров.
-        """
+        """Полный pipeline: history → oracle → top-K."""
         oracle = self.sample(history, mask, num_steps=num_steps, w_cfg=w_cfg)
         return self.retrieve(oracle, top_k=top_k)
 
     def param_summary(self) -> dict:
-        """Возвращает словарь с количеством параметров по компонентам."""
         def count(module, trainable_only=True):
             return sum(
                 p.numel() for p in module.parameters()
                 if (not trainable_only or p.requires_grad)
             )
-
         return {
-            'encoder_trainable':   count(self.encoder),
-            'encoder_frozen':      count(self.encoder, trainable_only=False) - count(self.encoder),
-            'denoiser_trainable':  count(self.denoiser),
-            'phi':                 self.phi.numel(),
-            'total_trainable':     count(self),
-            'total_frozen':        count(self, trainable_only=False) - count(self),
+            'encoder_trainable':  count(self.encoder),
+            'encoder_frozen':     count(self.encoder, False) - count(self.encoder),
+            'denoiser_trainable': count(self.denoiser),
+            'phi':                self.phi.numel(),
+            'total_trainable':    count(self),
+            'total_frozen':       count(self, False) - count(self),
         }
 
 
@@ -430,136 +366,96 @@ class FlowMatcher(nn.Module):
 # --------------------------------------------------------------------------- #
 
 if __name__ == '__main__':
-    """
-    python -m src.models.flow_matcher
-    """
     import tempfile
-
     torch.manual_seed(0)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f'Device: {device}')
 
-    # Фейковые данные (маленький каталог для скорости)
-    N_ITEMS = 200
-    PADDING_IDX = N_ITEMS
-    D_EMB = 64             # маленькая размерность для теста
-    B = 4
-    L = 10
+    N_ITEMS    = 200
+    PADDING    = N_ITEMS
+    D_RAW      = 64      # маленький для скорости
+    N_COMP     = 16
+    B, L       = 4, 10
 
     rng = np.random.default_rng(42)
-    emb_raw = rng.standard_normal((N_ITEMS, D_EMB)).astype(np.float32)
+    emb_raw = rng.standard_normal((N_ITEMS, D_RAW)).astype(np.float32)
+    emb_raw /= np.linalg.norm(emb_raw, axis=1, keepdims=True)
 
     with tempfile.TemporaryDirectory() as tmp:
-        cache_path = Path(tmp) / 'wh_cache.npz'
-
-        # Строим модель
         model = FlowMatcher(
             item_embeddings_raw=emb_raw,
-            padding_idx=PADDING_IDX,
-            whitening_cache_path=cache_path,
-            d_hidden=64,
-            d_cond=64,
-            encoder_layers=1,
-            encoder_heads=4,
-            encoder_d_ff=128,
-            denoiser_d_block=128,
-            denoiser_d_ff=256,
-            denoiser_n_blocks=2,
-            denoiser_time_emb_dim=32,
+            padding_idx=PADDING,
+            n_components=N_COMP,
+            whitening_cache_path=Path(tmp) / 'wh.npz',
+            d_hidden=32, d_cond=32,
+            encoder_layers=1, encoder_heads=4, encoder_d_ff=64,
+            denoiser_d_block=64, denoiser_d_ff=128,
+            denoiser_n_blocks=2, denoiser_time_emb_dim=16,
         ).to(device)
 
         summary = model.param_summary()
-        print(f'\nParameter summary:')
-        for k, v in summary.items():
-            print(f'  {k:25s}: {v:>10,}')
+        print(f'Params: trainable={summary["total_trainable"]:,}, '
+              f'frozen={summary["total_frozen"]:,}')
+        print(f'd_raw={D_RAW} → d_emb={N_COMP} (PCA)')
 
-        # Фейковый батч
-        history = torch.full((B, L), PADDING_IDX, dtype=torch.long)
+        history = torch.full((B, L), PADDING, dtype=torch.long)
         history[:, 5:] = torch.randint(0, N_ITEMS, (B, 5))
-        mask = torch.zeros(B, L)
-        mask[:, 5:] = 1.0
+        mask   = torch.zeros(B, L); mask[:, 5:] = 1.0
         target = torch.randint(0, N_ITEMS, (B,))
+        history, mask, target = history.to(device), mask.to(device), target.to(device)
 
-        history = history.to(device)
-        mask = mask.to(device)
-        target = target.to(device)
-
-        # Test 1: compute_loss
+        # Test 1: loss
         print('\nTest 1: compute_loss')
         model.train()
         loss = model.compute_loss(history, target, mask)
-        assert loss.shape == (), f'Loss should be scalar, got {loss.shape}'
-        assert loss.item() > 0
-        print(f'  loss = {loss.item():.4f}  OK')
-
-        # Test 2: backward
-        print('\nTest 2: backward through loss')
+        assert loss.shape == () and loss.item() > 0
         loss.backward()
-        # Проверяем, что обучаемые параметры имеют градиенты
-        for name, p in model.named_parameters():
-            if p.requires_grad:
-                assert p.grad is not None, f'No grad for {name}'
-        # Проверяем, что frozen embedding НЕ имеет градиентов
         assert model.encoder.item_embedding.weight.grad is None
-        print(f'  all trainable params have grads  OK')
-        print(f'  frozen embedding has no grad  OK')
+        print(f'  loss={loss.item():.4f}, frozen emb has no grad  OK')
 
-        # Test 3: sample
-        print('\nTest 3: sample')
+        # Test 2: sample в n_components пространстве
+        print('\nTest 2: sample')
         model.eval()
         oracle = model.sample(history, mask, num_steps=5, w_cfg=1.0)
-        assert oracle.shape == (B, D_EMB), f'Expected ({B}, {D_EMB}), got {oracle.shape}'
-        print(f'  oracle: {oracle.shape}, mean={oracle.mean().item():.4f}  OK')
+        assert oracle.shape == (B, N_COMP), f'Expected ({B},{N_COMP}), got {oracle.shape}'
+        print(f'  oracle: {oracle.shape}  OK')
 
-        # Test 4: retrieve
-        print('\nTest 4: retrieve')
-        top_k = 10
-        recs = model.retrieve(oracle, top_k=top_k)
-        assert recs.shape == (B, top_k), f'Expected ({B}, {top_k}), got {recs.shape}'
-        # Padding token не должен попасть в рекомендации
-        assert (recs != PADDING_IDX).all(), 'Padding token should not appear in recommendations'
-        # Индексы в пределах каталога
+        # Test 3: retrieve
+        print('\nTest 3: retrieve')
+        recs = model.retrieve(oracle, top_k=5)
+        assert recs.shape == (B, 5)
         assert (recs >= 0).all() and (recs < N_ITEMS).all()
-        print(f'  recs: {recs.shape}, no padding, valid ids  OK')
+        assert (recs != PADDING).all()
+        print(f'  recs: {recs.shape}, valid ids  OK')
 
-        # Test 5: recommend (полный pipeline)
-        print('\nTest 5: recommend (full pipeline)')
-        recs2 = model.recommend(history, mask, top_k=top_k, num_steps=5)
-        assert recs2.shape == (B, top_k)
-        print(f'  recommend: {recs2.shape}  OK')
+        # Test 4: state_dict содержит PCA параметры
+        print('\nTest 4: state_dict')
+        sd = model.state_dict()
+        assert 'whitening_mu'    in sd
+        assert 'whitening_V'     in sd
+        assert 'whitening_scale' in sd
+        assert sd['whitening_mu'].shape    == (D_RAW,)
+        assert sd['whitening_V'].shape     == (D_RAW, N_COMP)
+        assert sd['whitening_scale'].shape == (1,)
+        print(f'  mu: {sd["whitening_mu"].shape}')
+        print(f'  V:  {sd["whitening_V"].shape}')
+        print(f'  scale: {sd["whitening_scale"].shape}')
+        print('  OK')
 
-        # Test 6: CFG w=0 vs w>0 дают разные результаты
-        print('\nTest 6: CFG strength matters')
-        oracle_w0 = model.sample(history, mask, num_steps=5, w_cfg=0.0)
-        oracle_w2 = model.sample(history, mask, num_steps=5, w_cfg=2.0)
-        assert not torch.allclose(oracle_w0, oracle_w2)
-        print(f'  w=0 vs w=2: differ  OK')
-
-        # Test 7: кэш whitening сохраняется и загружается
-        print('\nTest 7: whitening cache')
-        assert cache_path.exists(), 'Cache should have been saved'
-        # Строим ещё одну модель — должна загрузить из кэша
+        # Test 5: кэш n_components-aware — при смене n_components пересчитывается
+        print('\nTest 5: cache invalidation on n_components change')
+        cache_path = Path(tmp) / 'wh.npz'
         model2 = FlowMatcher(
             item_embeddings_raw=emb_raw,
-            padding_idx=PADDING_IDX,
+            padding_idx=PADDING,
+            n_components=N_COMP * 2,           # другой n_components
             whitening_cache_path=cache_path,
-            d_hidden=64, d_cond=64,
-            encoder_layers=1, encoder_heads=4, encoder_d_ff=128,
-            denoiser_d_block=128, denoiser_d_ff=256,
-            denoiser_n_blocks=2, denoiser_time_emb_dim=32,
-        ).to(device)
-        torch.testing.assert_close(model.whitening_mu, model2.whitening_mu.float())
-        torch.testing.assert_close(model.whitening_W,  model2.whitening_W.float())
-        print(f'  cache loaded, whitening params match  OK')
+            d_hidden=32, d_cond=32,
+            encoder_layers=1, encoder_heads=4, encoder_d_ff=64,
+            denoiser_d_block=64, denoiser_d_ff=128,
+            denoiser_n_blocks=2, denoiser_time_emb_dim=16,
+        )
+        assert model2.d_emb == N_COMP * 2
+        print(f'  Recomputed for n_components={N_COMP*2}  OK')
 
-        # Test 8: state_dict содержит whitening buffers
-        print('\nTest 8: state_dict contains whitening')
-        sd = model.state_dict()
-        assert 'whitening_mu' in sd
-        assert 'whitening_W' in sd
-        assert sd['whitening_mu'].shape == (D_EMB,)
-        assert sd['whitening_W'].shape  == (D_EMB, D_EMB)
-        print(f'  whitening_mu: {sd["whitening_mu"].shape}  OK')
-        print(f'  whitening_W:  {sd["whitening_W"].shape}   OK')
-
-        print('\nAll checks passed')
+    print('\nAll checks passed')

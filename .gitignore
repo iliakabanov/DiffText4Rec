@@ -3,3 +3,4 @@
 *.csv
 *.jsonl
 *.pyc
+checkpoints/

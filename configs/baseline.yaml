@@ -1,35 +1,48 @@
 data:
-  processed_dir: ./data/processed
-  padding_token_id: 11924  # уточнить!
-
-model:
-  d_emb: 1536               # text-embedding-3-small
-  d_cond: 512
-  encoder:
-    n_layers: 2
-    n_heads: 8
-    d_ff: 2048
-  denoiser:
-    n_blocks: 6
-    d_block: 1024
-    d_ff: 2048
-    d_modulation: 512
-    time_emb_dim: 256
-
-training:
+  data_dir: ./data/ATG
+  emb_path: ./data/ATG/3large_emb.pickle
+  whitening_cache: ./data/processed/whitening_cache.npz
+  padding_idx: 11924
+  n_components: 256
   batch_size: 256
-  lr: 1e-4
-  weight_decay: 0.01
-  warmup_steps: 1000
-  grad_clip: 1.0
-  num_steps: 100000
-  p_uncond: 0.1
-  ema_decay: 0.9999
+  num_workers: 4
+  max_seq_len: 10
+
+encoder:
+  d_hidden: 512
+  d_cond: 512
+  layers: 2
+  heads: 8
+  d_ff: 2048
+  dropout: 0.1
+
+denoiser:
+  d_block: 512
+  d_ff: 1024
+  n_blocks: 6
+  time_emb_dim: 128
+  dropout: 0.0
 
 flow_matching:
-  tau_distribution: uniform
-  
-inference:
-  num_steps: 50
-  w_cfg: 1.0
+  p_uncond: 0.1
+  retrieval_metric: cosine   # 'dot' или 'cosine'
+
+optimizer:
+  lr: 5e-4
+  weight_decay: 0.01
+  grad_clip: null
+  num_epochs: 300
+  warmup_epochs: 0
+
+ema:
+  decay: 0.99
+
+eval:
+  every_epochs: 5
   top_k: [10, 20]
+  num_sample_steps: 50
+  w_cfg: 1.0
+
+output:
+  dir: ./checkpoints
+  run_name: baseline_4
