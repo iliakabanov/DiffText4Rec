@@ -74,13 +74,14 @@ class DreamRecText(nn.Module):
     ):
         super().__init__()
 
-        self.n_items          = item_embeddings_raw.shape[0]
-        self.padding_idx      = padding_idx
-        self.use_pca          = use_pca
-        self.T                = T
-        self.p_uncond         = p_uncond
-        self.w_cfg            = w_cfg
-        self.retrieval_metric = retrieval_metric
+        self.n_items                  = item_embeddings_raw.shape[0]
+        self.padding_idx              = padding_idx
+        self.use_pca                  = use_pca
+        self.per_component_whitening  = per_component_whitening
+        self.T                        = T
+        self.p_uncond                 = p_uncond
+        self.w_cfg                    = w_cfg
+        self.retrieval_metric         = retrieval_metric
 
         # ------------------------------------------------------------------ #
         # Item embeddings — FROZEN

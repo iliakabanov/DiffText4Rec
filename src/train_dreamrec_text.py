@@ -138,13 +138,14 @@ def save_checkpoint(path, model, ema, optimizer, scheduler, epoch, step, metrics
         'scheduler_state': scheduler.state_dict(),
         'metrics': metrics,
         'model_cfg': {
-            'n_items':          model.n_items,
-            'd_emb':            model.d_emb,
-            'use_pca':          model.use_pca,
-            'T':                model.T,
-            'w_cfg':            model.w_cfg,
-            'p_uncond':         model.p_uncond,
-            'retrieval_metric': model.retrieval_metric,
+            'n_items':                   model.n_items,
+            'd_emb':                     model.d_emb,
+            'use_pca':                   model.use_pca,
+            'per_component_whitening':   model.per_component_whitening,
+            'T':                         model.T,
+            'w_cfg':                     model.w_cfg,
+            'p_uncond':                  model.p_uncond,
+            'retrieval_metric':          model.retrieval_metric,
         },
     }, path)
 
