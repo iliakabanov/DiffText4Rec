@@ -1,0 +1,40 @@
+data:
+  data_dir: ./data/ATG
+  emb_path: ./data/ATG/3large_emb.pickle
+  whitening_cache: ./data/processed/whitening_cache.npz
+  padding_idx: 11924
+  n_items: 11924
+  batch_size: 1024
+  num_workers: 4
+  max_seq_len: 10
+
+model:
+  use_pca: true                    # false = raw 3072d TEM (медленнее), true = PCA n_components
+  n_components: 256                # игнорируется если use_pca: false
+  per_component_whitening: false   # true = Var(E)=I точно (метод авторов); false = глобальный std
+  n_heads: 4
+  d_ff: 1024
+  dropout: 0.1
+  T: 1000
+  beta_schedule: exp     # exp, linear, cosine
+  p_uncond: 0.0
+  w_cfg: 0.0
+  retrieval_metric: l2   # l2, dot, cosine
+
+optimizer:
+  lr: 1e-3
+  weight_decay: 0.0
+  grad_clip: 1.0
+  num_epochs: 500
+  warmup_epochs: 0
+
+ema:
+  decay: 0
+
+eval:
+  every_epochs: 10
+  top_k: [10, 20]
+
+output:
+  dir: ./checkpoints
+  run_name: dreamrec_text_pca_l2_nocfg_1

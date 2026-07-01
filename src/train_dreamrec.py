@@ -252,9 +252,9 @@ def train(cfg: DreamRecConfig) -> None:
     # ------------------------------------------------------------------ #
     # Resume
     # ------------------------------------------------------------------ #
-    start_epoch = 0
-    start_step  = 0
-    best_hr20   = 0.0
+    start_epoch  = 0
+    start_step   = 0
+    best_ndcg20  = 0.0
     latest_ckpt = out_dir / 'latest.pt'
     if latest_ckpt.exists():
         start_epoch, start_step = load_checkpoint(
@@ -350,13 +350,13 @@ def train(cfg: DreamRecConfig) -> None:
                 **metrics,
             })
 
-            if metrics.get('HR@20', 0) > best_hr20:
-                best_hr20 = metrics['HR@20']
+            if metrics.get('NDCG@20', 0) > best_ndcg20:
+                best_ndcg20 = metrics['NDCG@20']
                 save_checkpoint(
                     out_dir / 'best.pt', model, ema, optimizer, scheduler,
                     epoch=epoch + 1, step=step, metrics=metrics,
                 )
-                print(f'New best HR@20: {best_hr20:.4f} — saved best.pt')
+                print(f'New best NDCG@20: {best_ndcg20:.4f} — saved best.pt')
 
             save_checkpoint(
                 out_dir / 'latest.pt', model, ema, optimizer, scheduler,

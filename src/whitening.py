@@ -13,11 +13,15 @@ sequences модель не может выучить распределение
     3. Проекция: e_pca = e_c @ V_top  (N, n_components).
     4. Нормализация: e_norm = e_pca / scale.
 
-После этого:
-    - Размерность: 3072 → 256 (в 12 раз меньше).
-    - mean ≈ 0, std ≈ 1.
-    - Row norm ≈ sqrt(n_components) ≈ 16  (вместо sqrt(3072) ≈ 55).
-    - Flow matching обучается в 256d — feasible на ~15k sequences.
+Два режима нормализации (флаг per_component в compute_whitening):
+    per_component=False (по умолчанию):
+        scale — скаляр (глобальное std по всем n_components измерениям).
+        Var(E) после: неодинакова по компонентам (max >> min).
+
+    per_component=True (метод авторов iDreamRec, адаптированный):
+        scale — вектор (n_components,), каждый компонент делится на свой std.
+        Var(E) после: = I_{n_components} точно.
+        При любом alpha_t шумовой процесс DDIM: Var(E^t) = I.
 
 Retrieval делается в PCA-пространстве — эффективен потому что PCA
 максимизирует дисперсию и сохраняет ближайших соседей лучше чем
@@ -31,6 +35,9 @@ Retrieval делается в PCA-пространстве — эффектив�
     mu, V, scale = compute_whitening(emb_raw, n_components=256)
     emb_pca = apply_whitening(emb_raw, mu, V, scale)
     # emb_pca shape: (N, 256)
+
+apply_whitening, inverse_whitening и I/O работают с обоими режимами
+прозрачно: scale формы (1,) или (n_components,) — broadcasting справляется.
 """
 
 from __future__ import annotations
@@ -49,6 +56,7 @@ def compute_whitening(
     emb: np.ndarray,
     n_components: int = 256,
     eps: float = 1e-8,
+    per_component: bool = False,
     exclude_indices: Iterable[int] | None = None,
     verbose: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -57,25 +65,31 @@ def compute_whitening(
 
     Преобразование:
         e_pca  = (e - mu) @ V        # проекция в n_components-мерное пространство
-        e_norm = e_pca / scale       # нормализация std → 1
+        e_norm = e_pca / scale       # нормализация
 
     Args:
-        emb:          (N, D) — матрица эмбеддингов в исходном пространстве.
-        n_components: число главных компонент. По умолчанию 256.
-                      Рекомендуемые значения: 64, 128, 256, 512.
-        eps:          малая константа для численной стабильности scale.
+        emb:           (N, D) — матрица эмбеддингов в исходном пространстве.
+        n_components:  число главных компонент. По умолчанию 256.
+                       Рекомендуемые значения: 64, 128, 256, 512.
+        eps:           малая константа для численной стабильности scale.
+        per_component: если False (по умолчанию) — scale скаляр (глобальный std),
+                       Var(E) после неодинакова по компонентам.
+                       если True — scale вектор (n_components,), каждый компонент
+                       нормируется на свой std → Var(E) = I_{n_components} точно.
         exclude_indices: строки, не учитываемые при расчёте статистик.
-        verbose:      печатать диагностику.
+        verbose:       печатать диагностику.
 
     Returns:
-        mu:    (D,)              — среднее в исходном пространстве.
-        V:     (D, n_components) — матрица главных компонент (PCA basis).
-        scale: (1,)              — глобальное std в PCA-пространстве.
+        mu:    (D,)                          — среднее в исходном пространстве.
+        V:     (D, n_components)             — матрица главных компонент (PCA basis).
+        scale: (1,) или (n_components,)      — масштаб (глобальный или поэлементный).
 
     Notes:
         - SVD вычисляется через ковариационную матрицу (D, D) — это эффективно
           когда N > D (наш случай: 11924 > 3072).
         - V ортогональная: V.T @ V = I_{n_components}.
+        - apply_whitening и inverse_whitening работают с обоими форматами scale
+          прозрачно через broadcasting.
         - Обратная проекция: e_orig ≈ e_pca @ V.T * scale + mu
           (приближённая, т.к. PCA отбрасывает малые компоненты).
     """
@@ -116,19 +130,28 @@ def compute_whitening(
 
     # Шаг 3: проекция и нормализация
     projected = centered @ V                           # (N, n_components)
-    scale = float(projected.std()) + eps               # скаляр
+
+    if per_component:
+        # Каждый компонент делится на свой std → Var(E) = I_{n_components}
+        scale = projected.std(axis=0) + eps            # (n_components,)
+    else:
+        # Один глобальный std на все компоненты
+        scale = np.array([float(projected.std()) + eps])  # (1,)
 
     if verbose:
         var_explained = s[:n_components].sum() / s.sum() * 100
-        print(f'  PCA: {D}d → {n_components}d')
+        print(f'  PCA: {D}d -> {n_components}d')
         print(f'  Variance explained: {var_explained:.1f}%')
-        print(f'  scale: {scale:.6f}')
+        print(f'  per_component={per_component}')
         emb_norm = projected / scale
-        print(f'  After projection: mean={emb_norm.mean():.6f}, std={emb_norm.std():.6f}')
+        dim_var = emb_norm.var(axis=0)
+        print(f'  After projection: mean={emb_norm.mean():.6f}, '
+              f'per-dim var: mean={dim_var.mean():.4f} '
+              f'min={dim_var.min():.4f} max={dim_var.max():.4f}')
         print(f'  Row norm mean: {np.linalg.norm(emb_norm, axis=1).mean():.4f}')
         print(f'    (expected ~{n_components**0.5:.1f} for N(0,1) in {n_components}d)')
 
-    return mu, V, np.array([scale])
+    return mu, V, scale
 
 
 def apply_whitening(
@@ -146,16 +169,17 @@ def apply_whitening(
         emb:   (N, D) или (D,) — исходные эмбеддинги.
         mu:    (D,)             — среднее.
         V:     (D, n_components) — PCA basis.
-        scale: (1,)             — масштаб.
+        scale: (1,) или (n_components,) — масштаб (глобальный или поэлементный).
+                                          Оба формата работают через broadcasting.
 
     Returns:
         (N, n_components) или (n_components,) — нормализованные эмбеддинги.
         dtype: float32.
     """
-    s = float(scale.flat[0])
     e = emb.astype(np.float64, copy=False)
     mu_ = mu.astype(np.float64, copy=False)
     V_ = V.astype(np.float64, copy=False)
+    s = scale.astype(np.float64)          # (1,) или (n_components,) — broadcasting
     result = ((e - mu_) @ V_) / s
     return result.astype(np.float32)
 
@@ -177,15 +201,15 @@ def inverse_whitening(
         z:     (N, n_components) или (n_components,)
         mu:    (D,)
         V:     (D, n_components)
-        scale: (1,)
+        scale: (1,) или (n_components,) — оба формата работают через broadcasting.
 
     Returns:
         (N, D) — эмбеддинги в исходном пространстве, float32.
     """
-    s = float(scale.flat[0])
     z_f = z.astype(np.float64, copy=False)
     V_ = V.astype(np.float64, copy=False)
     mu_ = mu.astype(np.float64, copy=False)
+    s = scale.astype(np.float64)          # (1,) или (n_components,) — broadcasting
     result = (z_f * s) @ V_.T + mu_
     return result.astype(np.float32)
 
@@ -269,31 +293,40 @@ if __name__ == '__main__':
 
     print(f'Input: shape={emb.shape}, L2 norm={np.linalg.norm(emb, axis=1).mean():.4f}')
 
-    # Test 1: compute_whitening
-    print('\nTest 1: compute_whitening')
-    mu, V, scale = compute_whitening(emb, n_components=K, verbose=True)
+    # Test 1a: compute_whitening — глобальный std (per_component=False)
+    print('\nTest 1a: compute_whitening  per_component=False (global std)')
+    mu, V, scale = compute_whitening(emb, n_components=K, per_component=False, verbose=True)
     assert mu.shape == (D,)
     assert V.shape == (D, K)
-    assert scale.shape == (1,)
-    assert abs(float(scale.flat[0])) > 0
-    # V должна быть ортогональной
+    assert scale.shape == (1,), f'expected (1,), got {scale.shape}'
     VtV = V.T @ V
     assert np.allclose(VtV, np.eye(K), atol=1e-6), 'V not orthogonal'
-    print(f'  mu: {mu.shape}, V: {V.shape}, scale: {scale}')
-    print(f'  V orthogonality: ||V.T @ V - I||_F = {np.linalg.norm(VtV - np.eye(K)):.2e}  OK')
+    print(f'  scale shape: {scale.shape}  OK')
 
-    # Test 2: apply_whitening
-    print('\nTest 2: apply_whitening')
+    # Test 1b: compute_whitening — поэлементный std (per_component=True)
+    print('\nTest 1b: compute_whitening  per_component=True (per-component std)')
+    mu_pc, V_pc, scale_pc = compute_whitening(emb, n_components=K, per_component=True, verbose=True)
+    assert scale_pc.shape == (K,), f'expected ({K},), got {scale_pc.shape}'
+    print(f'  scale shape: {scale_pc.shape}  OK')
+
+    # Test 2a: apply_whitening — глобальный
+    print('\nTest 2a: apply_whitening  (global scale)')
     emb_pca = apply_whitening(emb, mu, V, scale)
     assert emb_pca.shape == (N, K)
     assert emb_pca.dtype == np.float32
     stats = verify_whitening(emb_pca)
-    print(f'  Output shape: {emb_pca.shape}')
-    print(f'  mean_abs_max:  {stats["mean_abs_max"]:.6f}  (should be ~0)')
-    print(f'  std_mean:      {stats["std_mean"]:.6f}  (should be ~1)')
-    print(f'  row_norm_mean: {stats["row_norm_mean"]:.4f}  (expected ~{stats["expected_norm"]:.2f})')
+    print(f'  std_mean={stats["std_mean"]:.6f}  (should be ~1)')
     assert stats['mean_abs_max'] < 0.1
     assert 0.9 < stats['std_mean'] < 1.1
+    print('  OK')
+
+    # Test 2b: apply_whitening — поэлементный → Var = I_{K}
+    print('\nTest 2b: apply_whitening  (per-component scale -> Var = I)')
+    emb_pc = apply_whitening(emb, mu_pc, V_pc, scale_pc)
+    assert emb_pc.shape == (N, K)
+    dim_var = emb_pc.astype(np.float64).var(axis=0)
+    print(f'  per-dim var: mean={dim_var.mean():.6f} max={dim_var.max():.6f}  (should be ~1)')
+    assert np.allclose(dim_var, 1.0, atol=0.01), f'Var != I: max dev = {np.abs(dim_var - 1).max():.4f}'
     print('  OK')
 
     # Test 3: inverse_whitening (приближённое)
@@ -317,7 +350,7 @@ if __name__ == '__main__':
     print('  Exact round-trip  OK')
 
     # Test 5: совместимость с реалистичными данными (11924 x 3072 → 256)
-    print('\nTest 5: realistic scale (simulated 1000 x 512 → 64)')
+    print('\nTest 5: realistic scale (simulated 1000 x 512 -> 64)')
     N2, D2, K2 = 1000, 512, 64
     emb2 = rng.standard_normal((N2, D2)).astype(np.float32)
     emb2 /= np.linalg.norm(emb2, axis=1, keepdims=True)
