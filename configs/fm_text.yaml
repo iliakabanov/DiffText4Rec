@@ -17,32 +17,36 @@ encoder:
   dropout: 0.1
 
 denoiser:
-  d_block: 512
+  d_block: 256
   d_ff: 1024
-  n_blocks: 6
+  n_blocks: 3
   time_emb_dim: 128
-  dropout: 0.0
+  dropout: 0.1
 
 flow_matching:
   p_uncond: 0.1
-  retrieval_metric: cosine   # 'dot' или 'cosine'
+  w_cfg: 1.0
+  retrieval_metric: cosine                 # 'dot', 'cosine' или 'l2'
+  per_component_whitening: true        # true = Var(E)=I точно; false = глобальный std
 
 optimizer:
-  lr: 5e-4
-  weight_decay: 0.01
+  lr: 1e-4
+  weight_decay: 0.0
   grad_clip: null
-  num_epochs: 300
+  num_epochs: 500
   warmup_epochs: 0
 
 ema:
-  decay: 0.99
+  decay: 0.9
 
 eval:
-  every_epochs: 5
+  every_epochs: 10
   top_k: [10, 20]
   num_sample_steps: 50
-  w_cfg: 1.0
 
 output:
   dir: ./checkpoints
-  run_name: baseline_4
+  run_name: fm_text_cosine_7
+
+reproducibility:
+  seed: 42

@@ -73,6 +73,7 @@ class FlowMatcher(nn.Module):
         item_embeddings_raw: np.ndarray,
         padding_idx: int,
         n_components: int = 256,
+        per_component_whitening: bool = False,
         whitening_cache_path: str | Path = './data/processed/whitening_cache.npz',
         # Encoder
         d_hidden: int = 512,
@@ -95,14 +96,15 @@ class FlowMatcher(nn.Module):
     ):
         super().__init__()
 
-        self.padding_idx = padding_idx
-        self.n_items = item_embeddings_raw.shape[0]
-        self.d_raw = item_embeddings_raw.shape[1]    # исходная размерность (3072)
-        self.d_emb = n_components                    # рабочая размерность FM (256)
-        self.n_components = n_components
-        self.p_uncond = p_uncond
-        self.d_cond = d_cond
-        self.retrieval_metric = retrieval_metric
+        self.padding_idx             = padding_idx
+        self.n_items                 = item_embeddings_raw.shape[0]
+        self.d_raw                   = item_embeddings_raw.shape[1]
+        self.d_emb                   = n_components
+        self.n_components            = n_components
+        self.per_component_whitening = per_component_whitening
+        self.p_uncond                = p_uncond
+        self.d_cond                  = d_cond
+        self.retrieval_metric        = retrieval_metric
 
         # ------------------------------------------------------------------ #
         # PCA + нормализация
@@ -111,6 +113,7 @@ class FlowMatcher(nn.Module):
             item_embeddings_raw,
             n_components,
             Path(whitening_cache_path),
+            per_component=per_component_whitening,
         )
 
         # Buffers: попадают в state_dict при сохранении модели
@@ -171,22 +174,27 @@ class FlowMatcher(nn.Module):
         emb_raw: np.ndarray,
         n_components: int,
         cache_path: Path,
+        per_component: bool = False,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Загружает PCA из кэша или вычисляет SVD."""
+        expected_scale_shape = (n_components,) if per_component else (1,)
         if cache_path.exists():
             data = np.load(cache_path)
-            # Проверяем совместимость n_components с кэшем
-            if 'V' in data and data['V'].shape[1] == n_components:
+            if ('V' in data and data['V'].shape[1] == n_components
+                    and data['scale'].shape == expected_scale_shape):
                 print(f'Loading whitening from cache: {cache_path}')
                 return data['mu'], data['V'], data['scale']
-            else:
-                cached_k = data['V'].shape[1] if 'V' in data else '?'
-                print(f'Cache has n_components={cached_k}, need {n_components}. Recomputing...')
+            cached_k = data['V'].shape[1] if 'V' in data else '?'
+            cached_scale = data['scale'].shape if 'scale' in data else '?'
+            print(f'Cache mismatch (n_components={cached_k}, scale={cached_scale}), '
+                  f'need ({n_components}, scale={expected_scale_shape}). Recomputing...')
 
-        print(f'Computing PCA {emb_raw.shape[1]}d → {n_components}d (may take ~30-60s)...')
+        print(f'Computing PCA {emb_raw.shape[1]}d -> {n_components}d '
+              f'(per_component={per_component})...')
         mu, V, scale = compute_whitening(
             emb_raw.astype(np.float64),
             n_components=n_components,
+            per_component=per_component,
             verbose=True,
         )
         save_whitening(cache_path, mu, V, scale)

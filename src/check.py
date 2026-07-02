@@ -1,7 +1,7 @@
 import torch
 import pickle
 import numpy as np
-from train import TrainConfig
+from train_fm_text import TrainConfig
 from data import build_dataloaders
 from models.flow_matcher import FlowMatcher
 

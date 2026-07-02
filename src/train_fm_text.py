@@ -8,7 +8,7 @@ Training loop для FlowMatcher.
     - Linear warmup по эпохам.
     - Gradient clipping.
     - Валидация каждые eval_every_epochs эпох с EMA-весами.
-    - Сохранение лучшего чекпойнта по HR@20 на val.
+    - Сохранение лучшего чекпойнта по NDCG@20 на val.
     - Логирование в CSV.
     - Resume из чекпойнта.
 """
@@ -73,8 +73,9 @@ class TrainConfig:
     denoiser_dropout: float = 0.0
 
     # Flow Matching
-    p_uncond: float = 0.1
-    retrieval_metric: str = 'dot'   # 'dot' или 'cosine'
+    p_uncond:                float = 0.1
+    retrieval_metric:        str   = 'dot'   # 'dot', 'cosine' или 'l2'
+    per_component_whitening: bool  = False   # True = Var(E)=I точно; False = глобальный std
 
     # Оптимизация
     lr: float = 1e-4
@@ -85,6 +86,9 @@ class TrainConfig:
 
     # EMA
     ema_decay: float = 0.9999
+
+    # Воспроизводимость
+    seed: int = 42
 
     # Eval и сохранение
     eval_every_epochs: int = 5     # оцениваем каждые N эпох
@@ -256,6 +260,9 @@ def train(cfg: TrainConfig) -> None:
     # ------------------------------------------------------------------ #
     # Setup
     # ------------------------------------------------------------------ #
+    torch.manual_seed(cfg.seed)
+    np.random.seed(cfg.seed)
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Device: {device}')
 
@@ -307,6 +314,7 @@ def train(cfg: TrainConfig) -> None:
         item_embeddings_raw=emb_raw,
         padding_idx=cfg.padding_idx,
         n_components=cfg.n_components,
+        per_component_whitening=cfg.per_component_whitening,
         whitening_cache_path=cfg.whitening_cache,
         d_hidden=cfg.d_hidden,
         d_cond=cfg.d_cond,
@@ -350,7 +358,7 @@ def train(cfg: TrainConfig) -> None:
     # ------------------------------------------------------------------ #
     start_epoch = 0
     start_step  = 0
-    best_hr20   = 0.0
+    best_ndcg20 = 0.0
     latest_ckpt = out_dir / 'latest.pt'
     if latest_ckpt.exists():
         start_epoch, start_step = load_checkpoint(
@@ -471,14 +479,14 @@ def train(cfg: TrainConfig) -> None:
             })
 
             # Лучший чекпойнт
-            if metrics.get('HR@20', 0) > best_hr20:
-                best_hr20 = metrics['HR@20']
+            if metrics.get('NDCG@20', 0) > best_ndcg20:
+                best_ndcg20 = metrics['NDCG@20']
                 save_checkpoint(
                     out_dir / 'best.pt',
                     model, ema, optimizer, scheduler,
                     epoch=epoch + 1, step=step, metrics=metrics,
                 )
-                print(f'New best HR@20: {best_hr20:.4f} — saved best.pt')
+                print(f'New best NDCG@20: {best_ndcg20:.4f} — saved best.pt')
 
             # Последний чекпойнт для resume
             save_checkpoint(
@@ -533,14 +541,14 @@ if __name__ == '__main__':
     import yaml
 
     parser = argparse.ArgumentParser()
-    default_cfg = Path(__file__).resolve().parent.parent / 'configs' / 'baseline.yaml'
+    default_cfg = Path(__file__).resolve().parent.parent / 'configs' / 'fm_text.yaml'
     parser.add_argument('--config', type=str, default=str(default_cfg))
     args = parser.parse_args()
 
     with open(args.config) as f:
         raw = yaml.safe_load(f)
 
-    d = raw.get('data', {})
+    d   = raw.get('data', {})
     enc = raw.get('encoder', {})
     den = raw.get('denoiser', {})
     fm  = raw.get('flow_matching', {})
@@ -548,6 +556,7 @@ if __name__ == '__main__':
     ema = raw.get('ema', {})
     ev  = raw.get('eval', {})
     out = raw.get('output', {})
+    rep = raw.get('reproducibility', {})
 
     cfg = TrainConfig(
         data_dir          = d.get('data_dir',        TrainConfig.data_dir),
@@ -569,8 +578,10 @@ if __name__ == '__main__':
         denoiser_n_blocks = den.get('n_blocks',       TrainConfig.denoiser_n_blocks),
         denoiser_time_emb_dim = den.get('time_emb_dim', TrainConfig.denoiser_time_emb_dim),
         denoiser_dropout  = den.get('dropout',        TrainConfig.denoiser_dropout),
-        p_uncond          = float(fm.get('p_uncond',         TrainConfig.p_uncond)),
-        retrieval_metric  = str(fm.get('retrieval_metric',  TrainConfig.retrieval_metric)),
+        p_uncond                = float(fm.get('p_uncond',                TrainConfig.p_uncond)),
+        retrieval_metric        = str(fm.get('retrieval_metric',         TrainConfig.retrieval_metric)),
+        per_component_whitening = bool(fm.get('per_component_whitening', TrainConfig.per_component_whitening)),
+        w_cfg                   = float(fm.get('w_cfg',                  TrainConfig.w_cfg)),
         lr                = float(opt.get('lr',             TrainConfig.lr)),
         weight_decay      = float(opt.get('weight_decay',   TrainConfig.weight_decay)),
         grad_clip         = (float(opt['grad_clip']) if opt.get('grad_clip') is not None
@@ -581,9 +592,9 @@ if __name__ == '__main__':
         eval_every_epochs = int(ev.get('every_epochs',    TrainConfig.eval_every_epochs)),
         top_k_values      = tuple(ev.get('top_k',    list(TrainConfig.top_k_values))),
         num_sample_steps  = int(ev.get('num_sample_steps', TrainConfig.num_sample_steps)),
-        w_cfg             = float(ev.get('w_cfg',           TrainConfig.w_cfg)),
         output_dir        = out.get('dir',            TrainConfig.output_dir),
         run_name          = out.get('run_name',       TrainConfig.run_name),
+        seed              = int(rep.get('seed',       TrainConfig.seed)),
     )
 
     train(cfg)
