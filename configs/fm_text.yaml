@@ -37,7 +37,7 @@ optimizer:
   warmup_epochs: 0
 
 ema:
-  decay: 0.9
+  decay: 0.0
 
 eval:
   every_epochs: 10

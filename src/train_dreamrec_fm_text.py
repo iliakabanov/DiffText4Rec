@@ -49,6 +49,7 @@ class DreamRecFMTextConfig:
     use_pca:                  bool  = True
     n_components:             int   = 256    # используется если use_pca=True
     per_component_whitening:  bool  = False  # True = Var(E)=I точно; False = глобальный std
+    # Encoder (SASRec)
     n_heads:          int   = 4
     d_ff:             int   = 1024
     dropout:          float = 0.1

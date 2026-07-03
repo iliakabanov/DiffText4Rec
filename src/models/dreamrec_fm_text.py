@@ -1,37 +1,28 @@
 """
-DreamRecFMText: архитектура DreamRecText, но вместо DDPM — Conditional Flow Matching.
+DreamRecFMText: Conditional Flow Matching для sequential recommendation
+с замороженными текстовыми эмбеддингами (TEM).
 
-Что сохранено от DreamRecText:
+Что сохранено от DreamRecText (DDPM-версии):
     - item_embedding: FROZEN (не обучается)
       * use_pca=True:  PCA-проекция TEM (3072d → n_components=256d)
       * use_pca=False: сырые TEM эмбеддинги (3072d)
-    - encoder: SASRecBlock — history → conditioning h (как в DreamRecText)
-    - CFG: через обучаемый none_embedding (как в DreamRecText)
+    - encoder: один SASRecBlock — история → conditioning h ∈ d_emb (каузальный self-attn).
+    - CFG: через обучаемый none_embedding (unconditional токен).
 
-Что меняется относительно DDPM:
-    DDPM (DreamRecText):
-        x_t = √ᾱ_t · z_0 + √(1-ᾱ_t) · ε,   t ∈ {0..T-1}
-        цель — предсказать z_0,  L = MSE(x_pred, z_0)
-        сэмплинг — обратная цепочка p_sample по T шагам.
-        денойзер — concat-MLP: Linear([x, h, t]) → GELU → Linear.
+Генеративный механизм — Flow Matching (velocity):
+    z_τ = (1 - τ) z_0 + τ z_1,   τ ∈ [0, 1]
+    z_0 ~ N(0, I),   z_1 = frozen emb(target)
+    цель — предсказать velocity u = z_1 - z_0,  L = MSE(v_pred, z_1 - z_0)
+    сэмплинг — Euler ODE от τ=0 до τ=1 за num_steps шагов.
+    денойзер — FiLM (MLPDenoiser): conditioning h модулирует каждый блок.
 
-    Flow Matching (здесь):
-        z_τ = (1 - τ) z_0 + τ z_1,   τ ∈ [0, 1]
-        z_0 ~ N(0, I),   z_1 = frozen emb(target)
-        цель — предсказать velocity u = z_1 - z_0,  L = MSE(v_pred, z_1 - z_0)
-        сэмплинг — Euler ODE от τ=0 до τ=1 за num_steps шагов.
-        денойзер — FiLM (MLPDenoiser), conditioning h модулирует каждый блок.
-
-Почему денойзер именно FiLM, а не concat (как в DDPM-версии):
+Почему FiLM-денойзер, а не concat (как в DDPM-версии DreamRec):
     Velocity-предсказание требует, чтобы сеть опиралась ТОЛЬКО на h — в u = z_1 - z_0
-    нет "лёгкого сигнала" из z_τ (в отличие от x_0-предсказания в DDPM, где при малом
-    шуме x_t ≈ x_0). При concat conditioning input projection учится в основном на z_τ
-    и почти игнорирует h (см. models/denoiser.py), из-за чего velocity-loss застревает
-    на E‖u‖² (предсказание нуля). FiLM подаёт h отдельно и модулирует каждый residual
-    блок — тогда velocity-loss обучается так же, как в fm_text. Энкодер и CFG-механизм
-    при этом остаются от DreamRec.
-
-Смысл: сравнить DDPM vs Flow Matching при том же энкодере/условии и frozen-эмбеддингах.
+    нет "лёгкого сигнала" из z_τ (в отличие от x_0-предсказания в DDPM). При concat
+    conditioning input projection учится в основном на z_τ и почти игнорирует h
+    (см. models/denoiser.py), из-за чего velocity-loss застревает на E‖u‖². FiLM
+    подаёт h отдельно и модулирует каждый residual блок. Энкодер (SASRec) и
+    CFG-механизм (none_embedding) при этом остаются от DreamRec.
 
 Совместим с evaluate() через recommend(history, mask, top_k, num_steps, w_cfg).
 """
@@ -56,7 +47,7 @@ from whitening import apply_whitening, compute_whitening, load_whitening, save_w
 
 class DreamRecFMText(nn.Module):
     """
-    DreamRec с замороженными TEM-эмбеддингами и Flow Matching вместо DDPM.
+    Conditional Flow Matching с замороженными TEM-эмбеддингами и SASRec-энкодером.
 
     Args:
         item_embeddings_raw:  (N_items, D_raw) — сырые TEM эмбеддинги.
@@ -64,10 +55,15 @@ class DreamRecFMText(nn.Module):
         use_pca:              True = PCA 3072→n_components, False = raw 3072d.
         n_components:         размерность PCA (используется если use_pca=True).
         whitening_cache_path: путь к кэшу PCA-параметров.
-        n_heads:              число голов self-attention.
-        d_ff:                 ширина FFN в энкодере.
+        n_heads:              число голов self-attention в SASRec-энкодере.
+        d_ff:                 ширина FFN в SASRec-энкодере.
         dropout:              dropout в энкодере и positional emb.
         max_seq_len:          максимальная длина истории.
+        denoiser_d_block:     внутренняя ширина денойзера.
+        denoiser_d_ff:        ширина FFN в денойзере.
+        denoiser_n_blocks:    число residual блоков денойзера.
+        denoiser_time_emb_dim: размерность time embedding.
+        denoiser_dropout:     dropout в денойзере.
         p_uncond:             вероятность CFG dropout при обучении.
         w_cfg:                сила CFG при инференсе.
         retrieval_metric:     'l2', 'dot', 'cosine'.
@@ -81,16 +77,18 @@ class DreamRecFMText(nn.Module):
         n_components: int = 256,
         per_component_whitening: bool = False,
         whitening_cache_path: str | Path = './data/processed/whitening_cache.npz',
+        # Encoder (SASRec)
         n_heads: int = 4,
         d_ff: int = 1024,
         dropout: float = 0.1,
         max_seq_len: int = 10,
-        # FiLM denoiser
+        # Denoiser (FiLM)
         denoiser_d_block: int = 256,
         denoiser_d_ff: int = 1024,
         denoiser_n_blocks: int = 3,
         denoiser_time_emb_dim: int = 128,
         denoiser_dropout: float = 0.1,
+        # CFG
         p_uncond: float = 0.1,
         w_cfg: float = 2.0,
         retrieval_metric: str = 'l2',
@@ -109,7 +107,6 @@ class DreamRecFMText(nn.Module):
         # Item embeddings — FROZEN
         # ------------------------------------------------------------------ #
         if use_pca:
-            # PCA-проекция (как в DreamRecText / FlowMatcher)
             mu, V, scale = self._load_or_compute_whitening(
                 item_embeddings_raw, n_components, Path(whitening_cache_path),
                 per_component=per_component_whitening,
@@ -120,7 +117,6 @@ class DreamRecFMText(nn.Module):
             emb = apply_whitening(item_embeddings_raw.astype(np.float32), mu, V, scale)
             self.d_emb = n_components
         else:
-            # Сырые TEM эмбеддинги
             emb = item_embeddings_raw.astype(np.float32)
             self.d_emb = item_embeddings_raw.shape[1]   # 3072
 
@@ -134,17 +130,18 @@ class DreamRecFMText(nn.Module):
         d = self.d_emb  # alias
 
         # ------------------------------------------------------------------ #
-        # Компоненты — идентичны DreamRecText
+        # SASRec-энкодер: история → conditioning h ∈ d_emb (как в DreamRecText)
         # ------------------------------------------------------------------ #
         self.pos_embedding  = nn.Embedding(max_seq_len, d)
-        self.none_embedding = nn.Embedding(1, d)    # обучаемый unconditional token
+        self.none_embedding = nn.Embedding(1, d)    # обучаемый unconditional токен
         self.dropout_emb    = nn.Dropout(dropout)
 
         self.encoder_block = SASRecBlock(d, n_heads, d_ff, dropout)
         self.encoder_norm  = nn.LayerNorm(d)
 
-        # FiLM-денойзер: conditioning h (размерности d) модулирует каждый блок.
-        # MLPDenoiser сам считает sinusoidal time embedding из τ ∈ [0, 1].
+        # ------------------------------------------------------------------ #
+        # FiLM-денойзер: работает в d_emb, conditioning h тоже d_emb
+        # ------------------------------------------------------------------ #
         self.denoiser = MLPDenoiser(
             d_emb=d,
             d_cond=d,
@@ -158,7 +155,7 @@ class DreamRecFMText(nn.Module):
         self._init_weights()
 
     # ---------------------------------------------------------------------- #
-    # PCA helpers (копия из DreamRecText)
+    # PCA helpers
     # ---------------------------------------------------------------------- #
 
     @staticmethod
@@ -194,7 +191,7 @@ class DreamRecFMText(nn.Module):
         # self.denoiser (MLPDenoiser) инициализируется внутри себя.
 
     # ---------------------------------------------------------------------- #
-    # History encoding — идентично DreamRecText
+    # History encoding — SASRec + CFG dropout (как в DreamRecText)
     # ---------------------------------------------------------------------- #
 
     def encode_history(
@@ -289,13 +286,13 @@ class DreamRecFMText(nn.Module):
             w_cfg:     сила CFG. None → self.w_cfg.
 
         Returns:
-            (B, d_emb) — oracle embedding.
+            (B, d_emb) — oracle embedding в пространстве товаров.
         """
         B      = h.shape[0]
         device = h.device
         w      = self.w_cfg if w_cfg is None else w_cfg
 
-        z  = torch.randn_like(h)
+        z  = torch.randn(B, self.d_emb, device=device)
         dt = 1.0 / num_steps
         for i in range(num_steps):
             tau      = torch.full((B,), i * dt, device=device)
@@ -372,8 +369,8 @@ if __name__ == '__main__':
                 w_cfg=1.0,
             ).to(device)
             summary = model.param_summary()
-            print(f'  d_emb={model.d_emb}, trainable={summary["total_trainable"]:,}, '
-                  f'frozen={summary["total_frozen"]:,}')
+            print(f'  d_emb={model.d_emb}, '
+                  f'trainable={summary["total_trainable"]:,}, frozen={summary["total_frozen"]:,}')
 
             history = torch.full((B, L), PADDING, dtype=torch.long, device=device)
             history[:, 5:] = torch.randint(0, N_ITEMS, (B, 5), device=device)
