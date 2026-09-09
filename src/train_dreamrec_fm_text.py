@@ -49,10 +49,13 @@ class DreamRecFMTextConfig:
     use_pca:                  bool  = True
     n_components:             int   = 256    # используется если use_pca=True
     per_component_whitening:  bool  = False  # True = Var(E)=I точно; False = глобальный std
-    # Encoder (SASRec)
-    n_heads:          int   = 4
-    d_ff:             int   = 1024
-    dropout:          float = 0.1
+    # Encoder (HistoryEncoder)
+    d_hidden:         int   = 512
+    d_cond:           int   = 512
+    encoder_layers:   int   = 2
+    encoder_heads:    int   = 8
+    encoder_d_ff:     int   = 2048
+    encoder_dropout:  float = 0.1
     # FiLM denoiser
     denoiser_d_block:      int   = 256
     denoiser_d_ff:         int   = 1024
@@ -240,9 +243,12 @@ def train(cfg: DreamRecFMTextConfig) -> None:
         n_components=cfg.n_components,
         per_component_whitening=cfg.per_component_whitening,
         whitening_cache_path=cfg.whitening_cache,
-        n_heads=cfg.n_heads,
-        d_ff=cfg.d_ff,
-        dropout=cfg.dropout,
+        d_hidden=cfg.d_hidden,
+        d_cond=cfg.d_cond,
+        encoder_layers=cfg.encoder_layers,
+        encoder_heads=cfg.encoder_heads,
+        encoder_d_ff=cfg.encoder_d_ff,
+        encoder_dropout=cfg.encoder_dropout,
         max_seq_len=cfg.max_seq_len,
         denoiser_d_block=cfg.denoiser_d_block,
         denoiser_d_ff=cfg.denoiser_d_ff,
@@ -433,6 +439,7 @@ if __name__ == '__main__':
 
     d   = raw.get('data', {})
     m   = raw.get('model', {})
+    enc = raw.get('encoder', {})
     den = raw.get('denoiser', {})
     opt = raw.get('optimizer', {})
     ema = raw.get('ema', {})
@@ -451,9 +458,12 @@ if __name__ == '__main__':
         use_pca                 = bool(m.get('use_pca',                   DreamRecFMTextConfig.use_pca)),
         n_components            = int(m.get('n_components',               DreamRecFMTextConfig.n_components)),
         per_component_whitening = bool(m.get('per_component_whitening',   DreamRecFMTextConfig.per_component_whitening)),
-        n_heads         = m.get('n_heads',               DreamRecFMTextConfig.n_heads),
-        d_ff            = m.get('d_ff',                  DreamRecFMTextConfig.d_ff),
-        dropout         = float(m.get('dropout',         DreamRecFMTextConfig.dropout)),
+        d_hidden        = int(enc.get('d_hidden',        DreamRecFMTextConfig.d_hidden)),
+        d_cond          = int(enc.get('d_cond',          DreamRecFMTextConfig.d_cond)),
+        encoder_layers  = int(enc.get('layers',          DreamRecFMTextConfig.encoder_layers)),
+        encoder_heads   = int(enc.get('heads',           DreamRecFMTextConfig.encoder_heads)),
+        encoder_d_ff    = int(enc.get('d_ff',            DreamRecFMTextConfig.encoder_d_ff)),
+        encoder_dropout = float(enc.get('dropout',       DreamRecFMTextConfig.encoder_dropout)),
         denoiser_d_block      = int(den.get('d_block',       DreamRecFMTextConfig.denoiser_d_block)),
         denoiser_d_ff         = int(den.get('d_ff',          DreamRecFMTextConfig.denoiser_d_ff)),
         denoiser_n_blocks     = int(den.get('n_blocks',      DreamRecFMTextConfig.denoiser_n_blocks)),

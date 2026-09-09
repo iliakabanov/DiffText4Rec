@@ -30,7 +30,7 @@ flow_matching:
   per_component_whitening: true        # true = Var(E)=I точно; false = глобальный std
 
 optimizer:
-  lr: 1e-4
+  lr: 1e-3
   weight_decay: 0.0
   grad_clip: null
   num_epochs: 500
@@ -42,11 +42,11 @@ ema:
 eval:
   every_epochs: 10
   top_k: [10, 20]
-  num_sample_steps: 50
+  num_sample_steps: 100
 
 output:
   dir: ./checkpoints
-  run_name: fm_text_cosine_7
+  run_name: fm_text_cosine_cfg
 
 reproducibility:
   seed: 42

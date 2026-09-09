@@ -140,6 +140,7 @@ def build_dataloaders(
     train_filename: str = 'train_data.df',
     val_filename: str = 'val_data.df',
     test_filename: str = 'test_data.df',
+    seed: int | None = None,
 ) -> dict[str, DataLoader]:
     """
     Создаёт DataLoader'ы для всех или подмножества сплитов.
@@ -151,6 +152,11 @@ def build_dataloaders(
         seq_len:     ожидаемая длина истории.
         splits:      какие сплиты загружать.
         pin_memory:  ускоряет перенос на GPU.
+        seed:        сид для шаффла train-сплита. Если None — шаффл берёт
+                     глобальный RNG, и порядок зависит от всего, что успело
+                     потратить случайность до создания лоадера. С явным сидом
+                     поток шаффла отвязан от dropout и сэмплинга негативов,
+                     поэтому одинаков между запусками.
 
     Returns:
         dict вида {'train': DataLoader, 'val': DataLoader, 'test': DataLoader},
@@ -173,6 +179,14 @@ def build_dataloaders(
 
         dataset = ATGDataset(path, seq_len=seq_len)
         is_train = (split == 'train')
+
+        # Свой генератор только для train: он же задаёт сиды воркерам.
+        # val/test идут без шаффла, случайность там не нужна.
+        generator = None
+        if is_train and seed is not None:
+            generator = torch.Generator()
+            generator.manual_seed(seed)
+
         loaders[split] = DataLoader(
             dataset,
             batch_size=batch_size,
@@ -181,6 +195,7 @@ def build_dataloaders(
             pin_memory=pin_memory,
             drop_last=is_train,   # для train выравнивает батчи; для val/test полная оценка
             persistent_workers=(num_workers > 0),
+            generator=generator,
         )
 
     return loaders

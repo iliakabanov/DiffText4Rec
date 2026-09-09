@@ -2,11 +2,10 @@
 DreamRecFMText: Conditional Flow Matching для sequential recommendation
 с замороженными текстовыми эмбеддингами (TEM).
 
-Что сохранено от DreamRecText (DDPM-версии):
+Что сохранено «в духе DreamRec»:
     - item_embedding: FROZEN (не обучается)
       * use_pca=True:  PCA-проекция TEM (3072d → n_components=256d)
       * use_pca=False: сырые TEM эмбеддинги (3072d)
-    - encoder: один SASRecBlock — история → conditioning h ∈ d_emb (каузальный self-attn).
     - CFG: через обучаемый none_embedding (unconditional токен).
 
 Генеративный механизм — Flow Matching (velocity):
@@ -14,15 +13,19 @@ DreamRecFMText: Conditional Flow Matching для sequential recommendation
     z_0 ~ N(0, I),   z_1 = frozen emb(target)
     цель — предсказать velocity u = z_1 - z_0,  L = MSE(v_pred, z_1 - z_0)
     сэмплинг — Euler ODE от τ=0 до τ=1 за num_steps шагов.
-    денойзер — FiLM (MLPDenoiser): conditioning h модулирует каждый блок.
+    денойзер — FiLM (MLPDenoiser): conditioning c модулирует каждый блок.
+
+Компоненты (те же, что в fm_text):
+    - encoder:  HistoryEncoder (Transformer, история → conditioning c ∈ d_cond).
+    - denoiser: MLPDenoiser (FiLM).
+Отличие от fm_text — CFG-механизм: здесь обучаемый none_embedding вместо phi.
 
 Почему FiLM-денойзер, а не concat (как в DDPM-версии DreamRec):
-    Velocity-предсказание требует, чтобы сеть опиралась ТОЛЬКО на h — в u = z_1 - z_0
+    Velocity-предсказание требует, чтобы сеть опиралась ТОЛЬКО на c — в u = z_1 - z_0
     нет "лёгкого сигнала" из z_τ (в отличие от x_0-предсказания в DDPM). При concat
-    conditioning input projection учится в основном на z_τ и почти игнорирует h
+    conditioning input projection учится в основном на z_τ и почти игнорирует c
     (см. models/denoiser.py), из-за чего velocity-loss застревает на E‖u‖². FiLM
-    подаёт h отдельно и модулирует каждый residual блок. Энкодер (SASRec) и
-    CFG-механизм (none_embedding) при этом остаются от DreamRec.
+    подаёт c отдельно и модулирует каждый residual блок.
 
 Совместим с evaluate() через recommend(history, mask, top_k, num_steps, w_cfg).
 """
@@ -40,14 +43,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.sasrec import SASRecBlock
+from models.encoder import HistoryEncoder
 from models.denoiser import MLPDenoiser
 from whitening import apply_whitening, compute_whitening, load_whitening, save_whitening
 
 
 class DreamRecFMText(nn.Module):
     """
-    Conditional Flow Matching с замороженными TEM-эмбеддингами и SASRec-энкодером.
+    Conditional Flow Matching с замороженными TEM-эмбеддингами и HistoryEncoder.
 
     Args:
         item_embeddings_raw:  (N_items, D_raw) — сырые TEM эмбеддинги.
@@ -55,9 +58,12 @@ class DreamRecFMText(nn.Module):
         use_pca:              True = PCA 3072→n_components, False = raw 3072d.
         n_components:         размерность PCA (используется если use_pca=True).
         whitening_cache_path: путь к кэшу PCA-параметров.
-        n_heads:              число голов self-attention в SASRec-энкодере.
-        d_ff:                 ширина FFN в SASRec-энкодере.
-        dropout:              dropout в энкодере и positional emb.
+        d_hidden:             скрытая размерность encoder'а.
+        d_cond:               размерность conditioning vector.
+        encoder_layers:       число Transformer слоёв encoder'а.
+        encoder_heads:        число attention голов encoder'а.
+        encoder_d_ff:         ширина FFN в encoder'е.
+        encoder_dropout:      dropout в encoder'е.
         max_seq_len:          максимальная длина истории.
         denoiser_d_block:     внутренняя ширина денойзера.
         denoiser_d_ff:        ширина FFN в денойзере.
@@ -77,12 +83,15 @@ class DreamRecFMText(nn.Module):
         n_components: int = 256,
         per_component_whitening: bool = False,
         whitening_cache_path: str | Path = './data/processed/whitening_cache.npz',
-        # Encoder (SASRec)
-        n_heads: int = 4,
-        d_ff: int = 1024,
-        dropout: float = 0.1,
+        # Encoder
+        d_hidden: int = 512,
+        d_cond: int = 512,
+        encoder_layers: int = 2,
+        encoder_heads: int = 8,
+        encoder_d_ff: int = 2048,
+        encoder_dropout: float = 0.1,
         max_seq_len: int = 10,
-        # Denoiser (FiLM)
+        # Denoiser
         denoiser_d_block: int = 256,
         denoiser_d_ff: int = 1024,
         denoiser_n_blocks: int = 3,
@@ -102,6 +111,7 @@ class DreamRecFMText(nn.Module):
         self.p_uncond                 = p_uncond
         self.w_cfg                    = w_cfg
         self.retrieval_metric         = retrieval_metric
+        self.d_cond                   = d_cond
 
         # ------------------------------------------------------------------ #
         # Item embeddings — FROZEN
@@ -121,30 +131,28 @@ class DreamRecFMText(nn.Module):
             self.d_emb = item_embeddings_raw.shape[1]   # 3072
 
         emb_with_pad = np.vstack([emb, np.zeros((1, self.d_emb), dtype=np.float32)])
-        self.item_embedding = nn.Embedding.from_pretrained(
-            torch.from_numpy(emb_with_pad),
-            freeze=True,
+
+        # ------------------------------------------------------------------ #
+        # Encoder: история → conditioning c (frozen item_embedding внутри)
+        # ------------------------------------------------------------------ #
+        self.encoder = HistoryEncoder(
+            item_embeddings=torch.from_numpy(emb_with_pad),
             padding_idx=padding_idx,
+            d_hidden=d_hidden,
+            d_cond=d_cond,
+            n_layers=encoder_layers,
+            n_heads=encoder_heads,
+            d_ff=encoder_d_ff,
+            dropout=encoder_dropout,
+            max_seq_len=max_seq_len,
         )
 
-        d = self.d_emb  # alias
-
         # ------------------------------------------------------------------ #
-        # SASRec-энкодер: история → conditioning h ∈ d_emb (как в DreamRecText)
-        # ------------------------------------------------------------------ #
-        self.pos_embedding  = nn.Embedding(max_seq_len, d)
-        self.none_embedding = nn.Embedding(1, d)    # обучаемый unconditional токен
-        self.dropout_emb    = nn.Dropout(dropout)
-
-        self.encoder_block = SASRecBlock(d, n_heads, d_ff, dropout)
-        self.encoder_norm  = nn.LayerNorm(d)
-
-        # ------------------------------------------------------------------ #
-        # FiLM-денойзер: работает в d_emb, conditioning h тоже d_emb
+        # FiLM-денойзер: работает в d_emb-пространстве, conditioning c ∈ d_cond
         # ------------------------------------------------------------------ #
         self.denoiser = MLPDenoiser(
-            d_emb=d,
-            d_cond=d,
+            d_emb=self.d_emb,
+            d_cond=d_cond,
             d_block=denoiser_d_block,
             d_ff=denoiser_d_ff,
             n_blocks=denoiser_n_blocks,
@@ -152,7 +160,9 @@ class DreamRecFMText(nn.Module):
             dropout=denoiser_dropout,
         )
 
-        self._init_weights()
+        # Обучаемый unconditional токен для CFG (в d_cond-пространстве).
+        self.none_embedding = nn.Embedding(1, d_cond)
+        nn.init.normal_(self.none_embedding.weight, 0.0, 1.0)
 
     # ---------------------------------------------------------------------- #
     # PCA helpers
@@ -182,16 +192,7 @@ class DreamRecFMText(nn.Module):
         return mu, V, scale
 
     # ---------------------------------------------------------------------- #
-    # Init
-    # ---------------------------------------------------------------------- #
-
-    def _init_weights(self) -> None:
-        nn.init.zeros_(self.pos_embedding.weight)
-        nn.init.normal_(self.none_embedding.weight, 0.0, 1.0)
-        # self.denoiser (MLPDenoiser) инициализируется внутри себя.
-
-    # ---------------------------------------------------------------------- #
-    # History encoding — SASRec + CFG dropout (как в DreamRecText)
+    # History encoding + CFG dropout
     # ---------------------------------------------------------------------- #
 
     def encode_history(
@@ -200,44 +201,34 @@ class DreamRecFMText(nn.Module):
         mask: torch.FloatTensor,
         apply_cfg_dropout: bool = False,
     ) -> torch.Tensor:
-        B, L   = history.shape
-        device = history.device
-
-        x = self.item_embedding(history)                                 # (B, L, d_emb)
-        x = x + self.pos_embedding(torch.arange(L, device=device))
-        x = self.dropout_emb(x)
-
-        causal_mask      = torch.triu(torch.ones(L, L, device=device, dtype=torch.bool), diagonal=1)
-        key_padding_mask = (mask == 0)
-
-        x = self.encoder_block(x, attn_mask=causal_mask, key_padding_mask=key_padding_mask)
-        x = self.encoder_norm(x)
-        x = torch.nan_to_num(x, nan=0.0)
-        h = x[:, -1, :]                                                  # (B, d_emb)
+        """История → conditioning c (B, d_cond). При обучении — CFG dropout."""
+        c = self.encoder(history, mask)                                  # (B, d_cond)
 
         if apply_cfg_dropout and self.training:
-            none_h    = self.none_embedding(torch.zeros(1, dtype=torch.long, device=device))
-            none_h    = none_h.expand(B, -1)
+            B         = history.shape[0]
+            device    = history.device
+            none_c    = self.none_embedding(torch.zeros(1, dtype=torch.long, device=device))
+            none_c    = none_c.expand(B, -1)
             drop_mask = torch.rand(B, device=device) < self.p_uncond
-            h = torch.where(drop_mask.unsqueeze(-1), none_h, h)
+            c = torch.where(drop_mask.unsqueeze(-1), none_c, c)
 
-        return h
+        return c
 
     # ---------------------------------------------------------------------- #
     # Denoiser / velocity net — FiLM, τ непрерывное в [0, 1]
     # ---------------------------------------------------------------------- #
 
-    def forward(self, x: torch.Tensor, h: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
-        """Предсказание velocity v(z_τ, τ, h). h — conditioning для FiLM."""
-        return self.denoiser(x, tau, h)
+    def forward(self, x: torch.Tensor, c: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
+        """Предсказание velocity v(z_τ, τ, c). c — conditioning для FiLM."""
+        return self.denoiser(x, tau, c)
 
     def forward_uncon(self, x: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
         """Unconditional velocity через обучаемый none_embedding (для CFG)."""
         B      = x.shape[0]
         device = x.device
-        none_h = self.none_embedding(torch.zeros(1, dtype=torch.long, device=device))
-        none_h = none_h.expand(B, -1)
-        return self.forward(x, none_h, tau)
+        none_c = self.none_embedding(torch.zeros(1, dtype=torch.long, device=device))
+        none_c = none_c.expand(B, -1)
+        return self.forward(x, none_c, tau)
 
     # ---------------------------------------------------------------------- #
     # Training — Conditional Flow Matching
@@ -252,7 +243,7 @@ class DreamRecFMText(nn.Module):
         B      = history.shape[0]
         device = history.device
 
-        z_1 = self.item_embedding(target)                                # (B, d_emb) — frozen
+        z_1 = self.encoder.item_embedding(target)                        # (B, d_emb) — frozen
         z_0 = torch.randn_like(z_1)                                      # (B, d_emb)
 
         tau   = torch.rand(B, device=device)                            # (B,) ~ U(0, 1)
@@ -261,8 +252,8 @@ class DreamRecFMText(nn.Module):
         z_tau  = (1.0 - tau_e) * z_0 + tau_e * z_1                       # (B, d_emb)
         u_true = z_1 - z_0                                              # (B, d_emb)
 
-        h      = self.encode_history(history, mask, apply_cfg_dropout=True)
-        v_pred = self.forward(z_tau, h, tau)
+        c      = self.encode_history(history, mask, apply_cfg_dropout=True)
+        v_pred = self.forward(z_tau, c, tau)
 
         return F.mse_loss(v_pred, u_true)
 
@@ -273,7 +264,7 @@ class DreamRecFMText(nn.Module):
     @torch.no_grad()
     def sample(
         self,
-        h: torch.Tensor,
+        c: torch.Tensor,
         num_steps: int = 50,
         w_cfg: float | None = None,
     ) -> torch.Tensor:
@@ -281,22 +272,22 @@ class DreamRecFMText(nn.Module):
         Euler ODE от τ=0 (шум) до τ=1 (цель) с CFG.
 
         Args:
-            h:         (B, d_emb) — conditioning из encode_history.
+            c:         (B, d_cond) — conditioning из encode_history.
             num_steps: число шагов Euler.
             w_cfg:     сила CFG. None → self.w_cfg.
 
         Returns:
             (B, d_emb) — oracle embedding в пространстве товаров.
         """
-        B      = h.shape[0]
-        device = h.device
+        B      = c.shape[0]
+        device = c.device
         w      = self.w_cfg if w_cfg is None else w_cfg
 
         z  = torch.randn(B, self.d_emb, device=device)
         dt = 1.0 / num_steps
         for i in range(num_steps):
             tau      = torch.full((B,), i * dt, device=device)
-            v_cond   = self.forward(z, h, tau)
+            v_cond   = self.forward(z, c, tau)
             v_uncond = self.forward_uncon(z, tau)
             v = (1.0 + w) * v_cond - w * v_uncond
             z = z + dt * v
@@ -312,9 +303,9 @@ class DreamRecFMText(nn.Module):
         num_steps: int = 50,
         w_cfg: float | None = None,
     ) -> torch.LongTensor:
-        h      = self.encode_history(history, mask, apply_cfg_dropout=False)
-        oracle = self.sample(h, num_steps=num_steps, w_cfg=w_cfg)
-        W      = self.item_embedding.weight[:self.n_items]
+        c      = self.encode_history(history, mask, apply_cfg_dropout=False)
+        oracle = self.sample(c, num_steps=num_steps, w_cfg=w_cfg)
+        W      = self.encoder.item_embedding.weight[:self.n_items]
 
         if self.retrieval_metric == 'cosine':
             scores = F.normalize(oracle, dim=-1) @ F.normalize(W, dim=-1).T
@@ -360,8 +351,11 @@ if __name__ == '__main__':
                 use_pca=use_pca,
                 n_components=8,
                 whitening_cache_path=Path(tmp) / 'wh.npz',
-                n_heads=2,
-                d_ff=32,
+                d_hidden=32,
+                d_cond=32,
+                encoder_layers=1,
+                encoder_heads=4,
+                encoder_d_ff=64,
                 denoiser_d_block=32,
                 denoiser_d_ff=64,
                 denoiser_n_blocks=2,
@@ -369,7 +363,7 @@ if __name__ == '__main__':
                 w_cfg=1.0,
             ).to(device)
             summary = model.param_summary()
-            print(f'  d_emb={model.d_emb}, '
+            print(f'  d_emb={model.d_emb}, d_cond={model.d_cond}, '
                   f'trainable={summary["total_trainable"]:,}, frozen={summary["total_frozen"]:,}')
 
             history = torch.full((B, L), PADDING, dtype=torch.long, device=device)
@@ -381,7 +375,7 @@ if __name__ == '__main__':
             loss = model.compute_loss(history, target, mask)
             assert not torch.isnan(loss), 'NaN loss!'
             loss.backward()
-            assert model.item_embedding.weight.grad is None, 'Frozen emb should have no grad'
+            assert model.encoder.item_embedding.weight.grad is None, 'Frozen emb should have no grad'
             print(f'  compute_loss: {loss.item():.4f}  (frozen emb OK)')
 
             model.eval()

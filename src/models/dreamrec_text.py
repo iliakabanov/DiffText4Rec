@@ -128,9 +128,7 @@ class DreamRecText(nn.Module):
         )
 
         self.denoiser = nn.Sequential(
-            nn.Linear(d * 3, d * 2),
-            nn.GELU(),
-            nn.Linear(d * 2, d),
+            nn.Linear(d * 3, d)
         )
 
         # ------------------------------------------------------------------ #
@@ -234,7 +232,7 @@ class DreamRecText(nn.Module):
     # ---------------------------------------------------------------------- #
 
     def _time_embed(self, t: torch.LongTensor) -> torch.Tensor:
-        t_norm = t.float() / self.T
+        t_norm = t.float()
         t_sin  = sinusoidal_embedding(t_norm, self.d_emb)
         return self.time_mlp(t_sin)
 
@@ -302,9 +300,51 @@ class DreamRecText(nn.Module):
 
     @torch.no_grad()
     def sample(self, h: torch.Tensor, num_steps: int | None = None) -> torch.Tensor:
+        """
+        DDPM reverse process от x_T до x_0.
+
+        num_steps: None или >= T — полная цепочка по всем T шагам (оригинал);
+                   < T — respaced ancestral DDPM: тот же стохастический процесс,
+                   но по равномерно прорежённой сетке из num_steps таймстепов.
+        """
+        if num_steps is None or num_steps >= self.T:
+            x = torch.randn_like(h)
+            for t_idx in reversed(range(self.T)):
+                x = self.p_sample(x, h, t_idx)
+            return x
+        return self._sample_respaced(h, num_steps)
+
+    @torch.no_grad()
+    def _sample_respaced(self, h: torch.Tensor, num_steps: int) -> torch.Tensor:
+        """Respaced ancestral DDPM по num_steps таймстепам (num_steps < T)."""
+        device = h.device
+        B      = h.shape[0]
+
+        S = torch.linspace(0, self.T - 1, num_steps, device=device).round().long()
+        S = torch.unique(S)                                   # по возрастанию, без дублей
+
+        ac      = self.alphas_cumprod[S]                      # (k,) ᾱ на выбранных шагах
+        ac_prev = torch.cat([ac.new_ones(1), ac[:-1]])
+        betas   = 1.0 - ac / ac_prev
+        alphas  = 1.0 - betas
+        coef1    = ac_prev.sqrt() * betas / (1.0 - ac)
+        coef2    = alphas.sqrt() * (1.0 - ac_prev) / (1.0 - ac)
+        post_var = ((1.0 - ac_prev) / (1.0 - ac) * betas).clamp(min=1e-20)
+
         x = torch.randn_like(h)
-        for t_idx in reversed(range(self.T)):
-            x = self.p_sample(x, h, t_idx)
+        for i in reversed(range(len(S))):
+            t = torch.full((B,), int(S[i].item()), dtype=torch.long, device=device)
+
+            x_start = self.forward(x, h, t)
+            if self.w_cfg != 0.0:
+                x_start_uncond = self.forward_uncon(x, t)
+                x_start = (1.0 + self.w_cfg) * x_start - self.w_cfg * x_start_uncond
+
+            model_mean = coef1[i] * x_start + coef2[i] * x
+            if i == 0:
+                x = model_mean
+            else:
+                x = model_mean + post_var[i].sqrt() * torch.randn_like(x)
         return x
 
     @torch.no_grad()
@@ -317,7 +357,7 @@ class DreamRecText(nn.Module):
         w_cfg: float | None = None,
     ) -> torch.LongTensor:
         h      = self.encode_history(history, mask, apply_cfg_dropout=False)
-        oracle = self.sample(h)
+        oracle = self.sample(h, num_steps=num_steps)
         W      = self.item_embedding.weight[:self.n_items]
 
         if self.retrieval_metric == 'cosine':

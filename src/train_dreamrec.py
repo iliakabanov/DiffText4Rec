@@ -64,6 +64,7 @@ class DreamRecConfig:
     # Eval и сохранение
     eval_every_epochs: int   = 10
     top_k_values:      tuple = (10, 20)
+    num_sample_steps:  int   = 1000   # шагов DDPM reverse; < T = respaced sampling
     output_dir:        str   = './checkpoints'
     run_name:          str   = 'dreamrec_baseline'
 
@@ -334,7 +335,7 @@ def train(cfg: DreamRecConfig) -> None:
                 model=model,
                 dataloader=val_loader,
                 top_k_values=cfg.top_k_values,
-                num_sample_steps=cfg.T,   # передаём для совместимости, модель игнорирует
+                num_sample_steps=cfg.num_sample_steps,
                 w_cfg=cfg.w_cfg,
                 device=device,
                 show_progress=True,
@@ -384,7 +385,7 @@ def train(cfg: DreamRecConfig) -> None:
         model=model,
         dataloader=loaders_test['test'],
         top_k_values=cfg.top_k_values,
-        num_sample_steps=cfg.T,
+        num_sample_steps=cfg.num_sample_steps,
         w_cfg=cfg.w_cfg,
         device=device,
         show_progress=True,
@@ -444,6 +445,7 @@ if __name__ == '__main__':
         seed          = int(raw.get('seed', DreamRecConfig.seed)),
         eval_every_epochs = int(ev.get('every_epochs', DreamRecConfig.eval_every_epochs)),
         top_k_values      = tuple(ev.get('top_k', list(DreamRecConfig.top_k_values))),
+        num_sample_steps  = int(ev.get('num_sample_steps', int(m.get('T', DreamRecConfig.T)))),
         output_dir = out.get('dir',      DreamRecConfig.output_dir),
         run_name   = out.get('run_name', DreamRecConfig.run_name),
     )

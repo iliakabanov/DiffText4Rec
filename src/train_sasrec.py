@@ -7,7 +7,7 @@ Training loop для SASRec baseline.
     - Linear warmup + constant lr
     - Gradient clipping
     - Валидация каждые eval_every_epochs эпох
-    - Лучший чекпойнт по HR@20 на val
+    - Лучший чекпойнт по NDCG@20 на val
     - Логирование в CSV
     - Resume из latest.pt
 
@@ -21,10 +21,12 @@ import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
 import csv
+import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -71,11 +73,39 @@ class SASRecConfig:
     # EMA
     ema_decay: float = 0.9999
 
+    # Воспроизводимость
+    seed: int = 42
+
     # Eval и сохранение
-    eval_every_epochs: int   = 5
+    eval_every_epochs: int   = 10
     top_k_values:      tuple = (10, 20)
     output_dir:        str   = './checkpoints'
     run_name:          str   = 'sasrec_baseline'
+
+
+# --------------------------------------------------------------------------- #
+# Воспроизводимость
+# --------------------------------------------------------------------------- #
+
+def setup_seed(seed: int) -> None:
+    """
+    Фиксирует все источники случайности, которые влияют на обучение:
+      - инициализацию весов (normal_/xavier_uniform_ в SASRec._init_weights),
+      - маски dropout,
+      - сэмплинг негативов в InfoNCE (torch.randint).
+
+    Порядок шаффла задаётся отдельно — через generator в build_dataloaders.
+
+    Побитовой воспроизводимости это НЕ даёт: backward у nn.Embedding
+    использует atomicAdd, порядок суммирования градиентов по повторяющимся
+    индексам на GPU не определён. Плюс автотюнинг cuBLAS и bfloat16 autocast.
+    Сид делает прогоны сравнимыми, но не идентичными — метрики baseline
+    всё равно нужно репортить как mean ± std по нескольким сидам.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 # --------------------------------------------------------------------------- #
@@ -199,6 +229,11 @@ def train(cfg: SASRecConfig) -> None:
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Device: {device}')
 
+    # До создания модели и лоадеров — иначе инициализация весов уже уйдёт
+    # на глобальном RNG, засеянном энтропией ОС.
+    setup_seed(cfg.seed)
+    print(f'Seed: {cfg.seed}')
+
     out_dir = Path(cfg.output_dir) / cfg.run_name
     out_dir.mkdir(parents=True, exist_ok=True)
     train_logger = CSVLogger(out_dir / 'log_train.csv')
@@ -213,6 +248,7 @@ def train(cfg: SASRecConfig) -> None:
         batch_size=cfg.batch_size,
         num_workers=cfg.num_workers,
         seq_len=cfg.max_seq_len,
+        seed=cfg.seed,
     )
     train_loader = loaders['train']
     val_loader   = loaders['val']
@@ -269,7 +305,7 @@ def train(cfg: SASRecConfig) -> None:
     # ------------------------------------------------------------------ #
     start_epoch = 0
     start_step  = 0
-    best_hr20   = 0.0
+    best_ndcg20 = 0.0
     latest_ckpt = out_dir / 'latest.pt'
     if latest_ckpt.exists():
         start_epoch, start_step = load_checkpoint(
@@ -354,7 +390,10 @@ def train(cfg: SASRecConfig) -> None:
                         val_loss += model.compute_loss(history, target, mask).item()
             val_loss /= len(val_loader)
 
-            torch.manual_seed(42)
+            # Никакого manual_seed здесь: recommend() у SASRec ничего не
+            # сэмплирует, так что ресид только сбрасывал глобальный RNG в одно
+            # и то же состояние каждые eval_every_epochs эпох — порядок шаффла
+            # и поток негативов InfoNCE начинали повторяться одним циклом.
             metrics = evaluate(
                 model=model,
                 dataloader=val_loader,
@@ -365,7 +404,6 @@ def train(cfg: SASRecConfig) -> None:
                 show_progress=True,
             )
 
-            torch.manual_seed(42)
             train_metrics = evaluate(
                 model=model,
                 dataloader=train_loader,
@@ -389,14 +427,14 @@ def train(cfg: SASRecConfig) -> None:
                 **metrics,
             })
 
-            if metrics.get('HR@20', 0) > best_hr20:
-                best_hr20 = metrics['HR@20']
+            if metrics.get('NDCG@20', 0) > best_ndcg20:
+                best_ndcg20 = metrics['NDCG@20']
                 save_checkpoint(
                     out_dir / 'best.pt',
                     model, ema, optimizer, scheduler,
                     epoch=epoch + 1, step=step, metrics=metrics,
                 )
-                print(f'New best HR@20: {best_hr20:.4f} — saved best.pt')
+                print(f'New best NDCG@20: {best_ndcg20:.4f} — saved best.pt')
 
             save_checkpoint(
                 out_dir / 'latest.pt',
@@ -486,6 +524,7 @@ if __name__ == '__main__':
         num_epochs    = int(opt.get('num_epochs',    SASRecConfig.num_epochs)),
         warmup_epochs = int(opt.get('warmup_epochs', SASRecConfig.warmup_epochs)),
         ema_decay     = float(ema.get('decay', SASRecConfig.ema_decay)),
+        seed          = int(raw.get('seed', SASRecConfig.seed)),
         eval_every_epochs = int(ev.get('every_epochs', SASRecConfig.eval_every_epochs)),
         top_k_values      = tuple(ev.get('top_k', list(SASRecConfig.top_k_values))),
         output_dir = out.get('dir',      SASRecConfig.output_dir),

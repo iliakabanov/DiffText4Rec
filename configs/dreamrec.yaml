@@ -32,6 +32,7 @@ ema:
 eval:
   every_epochs: 10
   top_k: [10, 20]
+  num_sample_steps: 1000   # шагов DDPM reverse; < T = respaced ancestral sampling
 
 output:
   dir: ./checkpoints

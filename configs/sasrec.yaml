@@ -1,5 +1,7 @@
+seed: 42
+
 data:
-  data_dir: ../data/ATG
+  data_dir: ./data/ATG
   padding_idx: 11924
   n_items: 11924
   batch_size: 256
@@ -8,10 +10,10 @@ data:
 
 model:
   d_model: 128
-  n_heads: 4
+  n_heads: 1
   n_layers: 1
-  d_ff: 512
-  dropout: 0.2
+  d_ff: 128
+  dropout: 0.1
   tie_weights: true
   loss: infonce
   neg_ratio: 64
@@ -21,14 +23,14 @@ optimizer:
   lr: 1e-3
   weight_decay: 1e-6
   grad_clip: 1.0
-  num_epochs: 500
-  warmup_epochs: 2
+  num_epochs: 100
+  warmup_epochs: 1
 
 ema:
   decay: 0.0
 
 eval:
-  every_epochs: 5
+  every_epochs: 10
   top_k: [10, 20]
 
 output:
