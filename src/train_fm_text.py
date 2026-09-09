@@ -548,22 +548,34 @@ if __name__ == '__main__':
     with open(args.config) as f:
         raw = yaml.safe_load(f)
 
+    # Секции переименованы под общий вид с configs/dreamrec_text.yaml:
+    #   flow_matching:      → model:
+    #   reproducibility.seed → seed (верхний уровень)
+    #   data.n_components    → model.n_components
+    # yaml.get() молча подставил бы дефолты, поэтому старый формат ловим явно.
+    legacy = [k for k in ('flow_matching', 'reproducibility') if k in raw]
+    if legacy:
+        raise ValueError(
+            f'{args.config}: устаревшие секции {legacy}. '
+            'Переименуй flow_matching → model, reproducibility.seed → seed '
+            '(верхний уровень), data.n_components → model.n_components — '
+            'см. configs/fm_text.yaml.'
+        )
+
     d   = raw.get('data', {})
+    m   = raw.get('model', {})
     enc = raw.get('encoder', {})
     den = raw.get('denoiser', {})
-    fm  = raw.get('flow_matching', {})
     opt = raw.get('optimizer', {})
     ema = raw.get('ema', {})
     ev  = raw.get('eval', {})
     out = raw.get('output', {})
-    rep = raw.get('reproducibility', {})
 
     cfg = TrainConfig(
         data_dir          = d.get('data_dir',        TrainConfig.data_dir),
         emb_path          = d.get('emb_path',         TrainConfig.emb_path),
         whitening_cache   = d.get('whitening_cache',  TrainConfig.whitening_cache),
         padding_idx       = d.get('padding_idx',      TrainConfig.padding_idx),
-        n_components      = d.get('n_components',     TrainConfig.n_components),
         batch_size        = d.get('batch_size',       TrainConfig.batch_size),
         num_workers       = d.get('num_workers',      TrainConfig.num_workers),
         max_seq_len       = d.get('max_seq_len',      TrainConfig.max_seq_len),
@@ -578,10 +590,11 @@ if __name__ == '__main__':
         denoiser_n_blocks = den.get('n_blocks',       TrainConfig.denoiser_n_blocks),
         denoiser_time_emb_dim = den.get('time_emb_dim', TrainConfig.denoiser_time_emb_dim),
         denoiser_dropout  = den.get('dropout',        TrainConfig.denoiser_dropout),
-        p_uncond                = float(fm.get('p_uncond',                TrainConfig.p_uncond)),
-        retrieval_metric        = str(fm.get('retrieval_metric',         TrainConfig.retrieval_metric)),
-        per_component_whitening = bool(fm.get('per_component_whitening', TrainConfig.per_component_whitening)),
-        w_cfg                   = float(fm.get('w_cfg',                  TrainConfig.w_cfg)),
+        n_components            = int(m.get('n_components',              TrainConfig.n_components)),
+        per_component_whitening = bool(m.get('per_component_whitening',  TrainConfig.per_component_whitening)),
+        p_uncond                = float(m.get('p_uncond',                TrainConfig.p_uncond)),
+        w_cfg                   = float(m.get('w_cfg',                   TrainConfig.w_cfg)),
+        retrieval_metric        = str(m.get('retrieval_metric',          TrainConfig.retrieval_metric)),
         lr                = float(opt.get('lr',             TrainConfig.lr)),
         weight_decay      = float(opt.get('weight_decay',   TrainConfig.weight_decay)),
         grad_clip         = (float(opt['grad_clip']) if opt.get('grad_clip') is not None
@@ -594,7 +607,7 @@ if __name__ == '__main__':
         num_sample_steps  = int(ev.get('num_sample_steps', TrainConfig.num_sample_steps)),
         output_dir        = out.get('dir',            TrainConfig.output_dir),
         run_name          = out.get('run_name',       TrainConfig.run_name),
-        seed              = int(rep.get('seed',       TrainConfig.seed)),
+        seed              = int(raw.get('seed',       TrainConfig.seed)),
     )
 
     train(cfg)

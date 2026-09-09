@@ -12,15 +12,15 @@ model:
   use_pca: true                    # false = raw 3072d TEM (медленнее), true = PCA n_components
   n_components: 256                # игнорируется если use_pca: false
   per_component_whitening: True   # true = Var(E)=I точно (метод авторов); false = глобальный std
-  p_uncond: 0.1
-  w_cfg: 1.0
+  p_uncond: 0.0
+  w_cfg: 0.0
   retrieval_metric: cosine   # l2, dot, cosine
 
 encoder:                 # HistoryEncoder (Transformer)
   d_hidden: 512
   d_cond: 512
   layers: 2
-  heads: 8
+  heads: 4
   d_ff: 2048
   dropout: 0.1
 
@@ -48,4 +48,4 @@ eval:
 
 output:
   dir: ./checkpoints
-  run_name: dreamrec_fm_text_cosine_3
+  run_name: dreamrec_fm_text_1
