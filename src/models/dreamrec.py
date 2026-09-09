@@ -135,9 +135,7 @@ class DreamRec(nn.Module):
         # Denoiser MLP (mlp2): concat([x, h, t]) → Linear(3d,2d) → GELU → Linear(2d,d)
         # ------------------------------------------------------------------ #
         self.denoiser = nn.Sequential(
-            nn.Linear(d_model * 3, d_model * 2),
-            nn.GELU(),
-            nn.Linear(d_model * 2, d_model),
+            nn.Linear(d_model * 3, d_model),
         )
 
         # ------------------------------------------------------------------ #
@@ -233,7 +231,7 @@ class DreamRec(nn.Module):
 
     def _time_embed(self, t: torch.LongTensor) -> torch.Tensor:
         """t: (B,) LongTensor → (B, d_model) via sinusoidal + MLP."""
-        t_norm = t.float() / self.T                                      # (B,) в [0, 1)
+        t_norm = t.float()                                  # (B,) в [0, 1)
         t_sin  = sinusoidal_embedding(t_norm, self.d_model)              # (B, d)
         return self.time_mlp(t_sin)                                      # (B, d)
 
