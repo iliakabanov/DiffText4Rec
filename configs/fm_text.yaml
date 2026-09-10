@@ -19,8 +19,8 @@ model:
 encoder:
   d_hidden: 512
   d_cond: 512
-  layers: 2
-  heads: 8
+  layers: 1
+  heads: 4
   d_ff: 2048
   dropout: 0.1
 
@@ -44,7 +44,7 @@ ema:
 eval:
   every_epochs: 10
   top_k: [10, 20]
-  num_sample_steps: 100   # шагов Euler ODE при сэмплинге
+  num_sample_steps: 50   # шагов Euler ODE при сэмплинге
 
 output:
   dir: ./checkpoints
