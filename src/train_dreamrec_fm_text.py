@@ -4,9 +4,6 @@ Training loop для DreamRecFMText (архитектура DreamRecText + Flow 
 use_pca: true  → PCA-проекция 3072d → n_components (быстро, рекомендуется)
 use_pca: false → сырые TEM 3072d (медленнее, для экспериментов)
 
-denoiser_type: linear → Linear(3d, d), как в DreamRecText
-denoiser_type: mlp    → Linear(3d, 2d) → GELU → Linear(2d, d)
-
 Запуск:
     python src/train_dreamrec_fm_text.py --config configs/dreamrec_fm_text.yaml
 """
@@ -55,7 +52,6 @@ class DreamRecFMTextConfig:
     n_heads:          int   = 4
     d_ff:             int   = 1024
     dropout:          float = 0.1
-    denoiser_type:    str   = 'mlp'   # 'linear' = Linear(3d,d) как в DreamRecText; 'mlp' = + GELU
     p_uncond:         float = 0.1
     w_cfg:            float = 2.0
     retrieval_metric: str   = 'l2'
@@ -145,7 +141,6 @@ def save_checkpoint(path, model, ema, optimizer, scheduler, epoch, step, metrics
             'd_emb':                     model.d_emb,
             'use_pca':                   model.use_pca,
             'per_component_whitening':   model.per_component_whitening,
-            'denoiser_type':             model.denoiser_type,
             'w_cfg':                     model.w_cfg,
             'p_uncond':                  model.p_uncond,
             'retrieval_metric':          model.retrieval_metric,
@@ -230,7 +225,7 @@ def train(cfg: DreamRecFMTextConfig) -> None:
     # ------------------------------------------------------------------ #
     # Model
     # ------------------------------------------------------------------ #
-    print(f'Building DreamRecFMText (use_pca={cfg.use_pca}, denoiser_type={cfg.denoiser_type})...')
+    print(f'Building DreamRecFMText (use_pca={cfg.use_pca})...')
     model = DreamRecFMText(
         item_embeddings_raw=emb_raw,
         padding_idx=cfg.padding_idx,
@@ -242,7 +237,6 @@ def train(cfg: DreamRecFMTextConfig) -> None:
         d_ff=cfg.d_ff,
         dropout=cfg.dropout,
         max_seq_len=cfg.max_seq_len,
-        denoiser_type=cfg.denoiser_type,
         p_uncond=cfg.p_uncond,
         w_cfg=cfg.w_cfg,
         retrieval_metric=cfg.retrieval_metric,
@@ -425,14 +419,17 @@ if __name__ == '__main__':
     with open(args.config) as f:
         raw = yaml.safe_load(f)
 
-    # Секции encoder:/denoiser: остались от HistoryEncoder + FiLM-денойзера.
+    # Секции encoder:/denoiser: остались от HistoryEncoder + FiLM-денойзера,
+    # model.denoiser_type — от эксперимента с mlp-денойзером (теперь денойзер всегда linear).
     # yaml.get() молча проигнорировал бы их, поэтому старый формат ловим явно.
     legacy = [k for k in ('encoder', 'denoiser') if k in raw]
+    if 'denoiser_type' in (raw.get('model') or {}):
+        legacy.append('model.denoiser_type')
     if legacy:
         raise ValueError(
-            f'{args.config}: устаревшие секции {legacy} (HistoryEncoder / FiLM). '
-            'Энкодер и денойзер теперь как в dreamrec_text: model.n_heads, model.d_ff, '
-            'model.dropout, model.denoiser_type — см. configs/dreamrec_fm_text.yaml.'
+            f'{args.config}: устаревшие ключи {legacy}. Энкодер и денойзер как в '
+            'dreamrec_text (денойзер — Linear(3d, d)), задаются model.n_heads, model.d_ff, '
+            'model.dropout — см. configs/dreamrec_fm_text.yaml.'
         )
 
     d   = raw.get('data', {})
@@ -457,7 +454,6 @@ if __name__ == '__main__':
         n_heads         = int(m.get('n_heads',           DreamRecFMTextConfig.n_heads)),
         d_ff            = int(m.get('d_ff',              DreamRecFMTextConfig.d_ff)),
         dropout         = float(m.get('dropout',         DreamRecFMTextConfig.dropout)),
-        denoiser_type   = str(m.get('denoiser_type',     DreamRecFMTextConfig.denoiser_type)),
         p_uncond        = float(m.get('p_uncond',        DreamRecFMTextConfig.p_uncond)),
         w_cfg           = float(m.get('w_cfg',           DreamRecFMTextConfig.w_cfg)),
         retrieval_metric = str(m.get('retrieval_metric', DreamRecFMTextConfig.retrieval_metric)),

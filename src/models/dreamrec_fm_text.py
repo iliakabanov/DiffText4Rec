@@ -20,12 +20,11 @@ DreamRecFMText: архитектура DreamRecText, генеративный п
     Обозначения: здесь z_0 — шум, z_1 — эмбеддинг товара. В DreamRecText
     наоборот: x_0 — эмбеддинг товара.
 
-denoiser_type:
-    'linear' — Linear(3d, d), как в DreamRecText. Истинное velocity-поле требует
-               τ-зависимого коэффициента при z_τ, а линейный слой с аддитивным
-               t_emb его не выражает — вариант для абляции.
-    'mlp'    — Linear(3d, 2d) → GELU → Linear(2d, d): нелинейность позволяет
-               времени взаимодействовать с z_τ.
+Денойзер — Linear(3d, d), как в DreamRecText. Известное ограничение: истинное
+velocity-поле требует τ-зависимого коэффициента при z_τ, а линейный слой с
+аддитивным t_emb его не выражает. Сеть не может погасить стартовый шум z_0, и он
+частично остаётся в oracle — поэтому при той же архитектуре FM уступает DDPM,
+где шум убирает сам сэмплер (posterior-коэффициенты).
 
 Время: τ ∈ [0, 1] масштабируется в τ·TIME_SCALE перед sinusoidal embedding —
 тот же диапазон [0, 1000), что raw t в DreamRecText. Без масштаба частоты
@@ -55,8 +54,6 @@ from whitening import apply_whitening, compute_whitening, save_whitening
 # τ ∈ [0, 1] → τ·TIME_SCALE ∈ [0, 1000): как raw t при T=1000 в DreamRecText.
 TIME_SCALE = 1000.0
 
-DENOISER_TYPES = ('linear', 'mlp')
-
 
 class DreamRecFMText(nn.Module):
     """
@@ -73,7 +70,6 @@ class DreamRecFMText(nn.Module):
         d_ff:                    ширина FFN в энкодере.
         dropout:                 dropout в энкодере и positional emb.
         max_seq_len:             максимальная длина истории.
-        denoiser_type:           'linear' или 'mlp' (см. docstring модуля).
         p_uncond:                вероятность CFG dropout при обучении.
         w_cfg:                   сила CFG при инференсе.
         retrieval_metric:        'l2', 'dot', 'cosine'.
@@ -91,21 +87,16 @@ class DreamRecFMText(nn.Module):
         d_ff: int = 1024,
         dropout: float = 0.1,
         max_seq_len: int = 10,
-        denoiser_type: str = 'mlp',
         p_uncond: float = 0.1,
         w_cfg: float = 2.0,
         retrieval_metric: str = 'l2',
     ):
         super().__init__()
 
-        if denoiser_type not in DENOISER_TYPES:
-            raise ValueError(f'denoiser_type must be one of {DENOISER_TYPES}, got {denoiser_type!r}')
-
         self.n_items                  = item_embeddings_raw.shape[0]
         self.padding_idx              = padding_idx
         self.use_pca                  = use_pca
         self.per_component_whitening  = per_component_whitening
-        self.denoiser_type            = denoiser_type
         self.p_uncond                 = p_uncond
         self.w_cfg                    = w_cfg
         self.retrieval_metric         = retrieval_metric
@@ -153,18 +144,11 @@ class DreamRecFMText(nn.Module):
         )
 
         # ------------------------------------------------------------------ #
-        # Денойзер: concat([z_τ, h, t_emb]) → velocity
+        # Денойзер: concat([z_τ, h, t_emb]) → velocity, Linear(3d, d) как в DreamRecText
         # ------------------------------------------------------------------ #
-        if denoiser_type == 'linear':
-            self.denoiser = nn.Sequential(
-                nn.Linear(d * 3, d),
-            )
-        else:  # 'mlp'
-            self.denoiser = nn.Sequential(
-                nn.Linear(d * 3, d * 2),
-                nn.GELU(),
-                nn.Linear(d * 2, d),
-            )
+        self.denoiser = nn.Sequential(
+            nn.Linear(d * 3, d),
+        )
 
         self._init_weights()
 
@@ -382,40 +366,38 @@ if __name__ == '__main__':
 
     with tempfile.TemporaryDirectory() as tmp:
         for use_pca in [True, False]:
-            for denoiser_type in DENOISER_TYPES:
-                print(f'\n--- use_pca={use_pca}, denoiser_type={denoiser_type} ---')
-                model = DreamRecFMText(
-                    item_embeddings_raw=emb_raw,
-                    padding_idx=PADDING,
-                    use_pca=use_pca,
-                    n_components=8,
-                    whitening_cache_path=Path(tmp) / 'wh.npz',
-                    n_heads=2,
-                    d_ff=32,
-                    denoiser_type=denoiser_type,
-                    w_cfg=1.0,
-                ).to(device)
-                summary = model.param_summary()
-                print(f'  d_emb={model.d_emb}, trainable={summary["total_trainable"]:,}, '
-                      f'frozen={summary["total_frozen"]:,}')
+            print(f'\n--- use_pca={use_pca} ---')
+            model = DreamRecFMText(
+                item_embeddings_raw=emb_raw,
+                padding_idx=PADDING,
+                use_pca=use_pca,
+                n_components=8,
+                whitening_cache_path=Path(tmp) / 'wh.npz',
+                n_heads=2,
+                d_ff=32,
+                w_cfg=1.0,
+            ).to(device)
+            summary = model.param_summary()
+            print(f'  d_emb={model.d_emb}, trainable={summary["total_trainable"]:,}, '
+                  f'frozen={summary["total_frozen"]:,}')
 
-                history = torch.full((B, L), PADDING, dtype=torch.long, device=device)
-                history[:, 5:] = torch.randint(0, N_ITEMS, (B, 5), device=device)
-                mask    = torch.zeros(B, L, device=device); mask[:, 5:] = 1.0
-                target  = torch.randint(0, N_ITEMS, (B,), device=device)
+            history = torch.full((B, L), PADDING, dtype=torch.long, device=device)
+            history[:, 5:] = torch.randint(0, N_ITEMS, (B, 5), device=device)
+            mask    = torch.zeros(B, L, device=device); mask[:, 5:] = 1.0
+            target  = torch.randint(0, N_ITEMS, (B,), device=device)
 
-                model.train()
-                loss = model.compute_loss(history, target, mask)
-                assert not torch.isnan(loss), 'NaN loss!'
-                loss.backward()
-                assert model.item_embedding.weight.grad is None, 'Frozen emb should have no grad'
-                assert model.encoder_block.parameters().__next__().grad is not None, \
-                    'Encoder should receive grad'
-                print(f'  compute_loss: {loss.item():.4f}  (frozen emb OK, encoder grad OK)')
+            model.train()
+            loss = model.compute_loss(history, target, mask)
+            assert not torch.isnan(loss), 'NaN loss!'
+            loss.backward()
+            assert model.item_embedding.weight.grad is None, 'Frozen emb should have no grad'
+            assert model.encoder_block.parameters().__next__().grad is not None, \
+                'Encoder should receive grad'
+            print(f'  compute_loss: {loss.item():.4f}  (frozen emb OK, encoder grad OK)')
 
-                model.eval()
-                recs = model.recommend(history, mask, top_k=5, num_steps=5)
-                assert recs.shape == (B, 5) and (recs < N_ITEMS).all()
-                print(f'  recommend: {recs.shape}  OK')
+            model.eval()
+            recs = model.recommend(history, mask, top_k=5, num_steps=5)
+            assert recs.shape == (B, 5) and (recs < N_ITEMS).all()
+            print(f'  recommend: {recs.shape}  OK')
 
     print('\nAll checks passed')

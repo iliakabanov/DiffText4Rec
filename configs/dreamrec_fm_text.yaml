@@ -17,7 +17,6 @@ model:
   n_heads: 4
   d_ff: 1024
   dropout: 0.1
-  denoiser_type: linear    # linear = Linear(3d,d) как в dreamrec_text; mlp = Linear(3d,2d) → GELU → Linear(2d,d)
   p_uncond: 0.0
   w_cfg: 0.0
   retrieval_metric: cosine   # l2, dot, cosine
@@ -39,4 +38,4 @@ eval:
 
 output:
   dir: ./checkpoints
-  run_name: dreamrec_fm_text_4
+  run_name: dreamrec_fm_text
