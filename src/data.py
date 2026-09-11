@@ -14,6 +14,7 @@ frozen nn.Embedding и индексируются по id из батча. Эт�
 
 from __future__ import annotations
 
+import pickle
 from pathlib import Path
 from typing import Iterable
 
@@ -199,6 +200,15 @@ def build_dataloaders(
         )
 
     return loaders
+
+
+def load_item_embeddings(path: str | Path) -> np.ndarray:
+    """Текстовые эмбеддинги товаров из pickle → float32-массив (N_items, D)."""
+    with open(path, 'rb') as f:
+        emb = pickle.load(f)
+    if not isinstance(emb, np.ndarray):
+        raise ValueError(f'{path}: ожидался numpy-массив, получен {type(emb).__name__}')
+    return emb.astype(np.float32)
 
 
 # --------------------------------------------------------------------------- #

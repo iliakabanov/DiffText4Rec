@@ -30,9 +30,6 @@ optimizer:
   num_epochs: 150
   warmup_epochs: 0
 
-ema:
-  decay: 0
-
 eval:
   every_epochs: 10
   top_k: [10, 20]

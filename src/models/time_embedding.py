@@ -50,7 +50,7 @@ def sinusoidal_embedding(t: torch.Tensor, dim: int, max_period: int = 10_000) ->
 
 if __name__ == '__main__':
     """
-    python src/models/denoiser.py
+    python src/models/time_embedding.py
     """
     import torch.nn.functional as F
 

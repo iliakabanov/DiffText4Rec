@@ -283,7 +283,6 @@ if __name__ == '__main__':
     """
     python -m src.whitening
     """
-    import sys
     rng = np.random.default_rng(42)
 
     # Симулируем L2-нормированные эмбеддинги как у OpenAI (N=500, D=128)

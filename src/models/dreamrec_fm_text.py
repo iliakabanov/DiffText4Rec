@@ -47,7 +47,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.sasrec import SASRecBlock
-from models.denoiser import sinusoidal_embedding
+from models.time_embedding import sinusoidal_embedding
 from whitening import apply_whitening, compute_whitening, save_whitening
 
 

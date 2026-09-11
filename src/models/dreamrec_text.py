@@ -15,7 +15,6 @@ DreamRecText: DreamRec с замороженными текстовыми эмб
 
 from __future__ import annotations
 
-import math
 import sys
 from pathlib import Path
 
@@ -28,9 +27,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.sasrec import SASRecBlock
-from models.denoiser import sinusoidal_embedding
-from whitening import apply_whitening, compute_whitening, load_whitening, save_whitening
-from models.dreamrec import _exp_schedule, _linear_schedule, _cosine_schedule, _make_schedule
+from models.time_embedding import sinusoidal_embedding
+from whitening import apply_whitening, compute_whitening, save_whitening
+from models.dreamrec import _make_schedule
 
 
 class DreamRecText(nn.Module):
