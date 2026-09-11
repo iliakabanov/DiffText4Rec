@@ -2,12 +2,12 @@
 DreamRec: Unleashing Large Language Models for Sequential Recommendation
 (Wang et al., 2023) — реализация для ATG датасета.
 
-Ключевые особенности vs FlowMatcher/DDPM:
-    - Item embeddings обучаются с нуля (не PCA/TEM)
+Ключевые особенности:
+    - Item embeddings обучаются с нуля (в отличие от frozen TEM в DreamRecText)
     - x_start parameterization: денойзер предсказывает чистый эмбеддинг z_0
-    - Простой MLP-денойзер: concat([x_t, h, t_emb]) → Linear → GELU → Linear
+    - Линейный денойзер: concat([x_t, h, t_emb]) → Linear(3d, d)
     - Стохастический DDPM reverse process (не DDIM)
-    - CFG: none_embedding вместо phi-вектора
+    - CFG: обучаемый none_embedding
 
 Совместим с evaluate() через recommend(history, mask, top_k, num_steps, w_cfg).
 """
@@ -132,7 +132,7 @@ class DreamRec(nn.Module):
         )
 
         # ------------------------------------------------------------------ #
-        # Denoiser MLP (mlp2): concat([x, h, t]) → Linear(3d,2d) → GELU → Linear(2d,d)
+        # Denoiser: concat([x, h, t]) → Linear(3d, d)
         # ------------------------------------------------------------------ #
         self.denoiser = nn.Sequential(
             nn.Linear(d_model * 3, d_model),
@@ -231,8 +231,7 @@ class DreamRec(nn.Module):
 
     def _time_embed(self, t: torch.LongTensor) -> torch.Tensor:
         """t: (B,) LongTensor → (B, d_model) via sinusoidal + MLP."""
-        t_norm = t.float()                                  # (B,) в [0, 1)
-        t_sin  = sinusoidal_embedding(t_norm, self.d_model)              # (B, d)
+        t_sin  = sinusoidal_embedding(t.float(), self.d_model)           # (B, d), t ∈ [0, T)
         return self.time_mlp(t_sin)                                      # (B, d)
 
     def forward(

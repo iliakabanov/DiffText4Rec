@@ -419,8 +419,9 @@ if __name__ == '__main__':
     with open(args.config) as f:
         raw = yaml.safe_load(f)
 
-    # Секции encoder:/denoiser: остались от HistoryEncoder + FiLM-денойзера,
-    # model.denoiser_type — от эксперимента с mlp-денойзером (теперь денойзер всегда linear).
+    # Секции encoder:/denoiser: остались от прежней версии модели (Transformer-энкодер
+    # + FiLM-денойзер), model.denoiser_type — от эксперимента с mlp-денойзером
+    # (теперь денойзер всегда linear).
     # yaml.get() молча проигнорировал бы их, поэтому старый формат ловим явно.
     legacy = [k for k in ('encoder', 'denoiser') if k in raw]
     if 'denoiser_type' in (raw.get('model') or {}):

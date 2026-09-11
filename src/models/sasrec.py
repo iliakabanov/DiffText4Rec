@@ -8,7 +8,7 @@ SASRec: Self-Attentive Sequential Recommendation (Kang & McAuley, 2018).
     → h[:, -1, :]  (последняя позиция = последний реальный айтем при left-padding)
     → logits = h @ item_emb.weight[:n_items].T  (tied weights)
 
-Интерфейс совместим с FlowMatcher:
+Интерфейс общий с DreamRec-моделями и evaluate():
     compute_loss(history, target, mask)  → scalar
     recommend(history, mask, top_k, ...) → (B, top_k) LongTensor
 """

@@ -36,4 +36,4 @@ eval:
 
 output:
   dir: ./checkpoints
-  run_name: dreamrec_2
+  run_name: dreamrec_1

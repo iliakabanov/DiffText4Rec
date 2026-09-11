@@ -87,7 +87,7 @@ class DreamRecText(nn.Module):
         # Item embeddings — FROZEN
         # ------------------------------------------------------------------ #
         if use_pca:
-            # PCA-проекция (как в FlowMatcher)
+            # PCA-проекция + whitening (см. whitening.py)
             mu, V, scale = self._load_or_compute_whitening(
                 item_embeddings_raw, n_components, Path(whitening_cache_path),
                 per_component=per_component_whitening,
@@ -155,7 +155,7 @@ class DreamRecText(nn.Module):
         self._init_weights()
 
     # ---------------------------------------------------------------------- #
-    # PCA helpers (копия из FlowMatcher)
+    # PCA helpers (кэш whitening-параметров на диске)
     # ---------------------------------------------------------------------- #
 
     @staticmethod

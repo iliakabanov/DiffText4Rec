@@ -30,7 +30,7 @@ Retrieval делается в PCA-пространстве — эффектив�
 Хранение параметров
 -------------------
 Параметры (mu, V, scale) вычисляются один раз, хранятся как buffers
-в FlowMatcher (state_dict) и кэшируются на диск.
+в модели (state_dict DreamRecText / DreamRecFMText) и кэшируются на диск.
 
     mu, V, scale = compute_whitening(emb_raw, n_components=256)
     emb_pca = apply_whitening(emb_raw, mu, V, scale)

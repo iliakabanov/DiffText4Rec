@@ -38,4 +38,4 @@ eval:
 
 output:
   dir: ./checkpoints
-  run_name: dreamrec_fm_text
+  run_name: dreamrec_fm_text_1

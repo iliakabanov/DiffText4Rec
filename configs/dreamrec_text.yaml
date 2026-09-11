@@ -40,4 +40,4 @@ eval:
 
 output:
   dir: ./checkpoints
-  run_name: dreamrec_text_full3072
+  run_name: dreamrec_text_1

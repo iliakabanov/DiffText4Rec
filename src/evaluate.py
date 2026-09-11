@@ -92,15 +92,16 @@ def evaluate(
     Full-rank evaluation на одном split (val или test).
 
     Для каждого батча:
-        1. Генерируем oracle embeddings через Euler ODE.
-        2. Retrieval top-max(K) по всему каталогу.
-        3. Считаем HR@K и NDCG@K для каждого K.
+        1. model.recommend(): история → top-max(K) товаров по всему каталогу
+           (у генеративных моделей — через сэмплинг oracle embedding).
+        2. Считаем HR@K и NDCG@K для каждого K.
 
     Args:
-        model:            FlowMatcher — должна быть в eval mode.
+        model:            модель с recommend(history, mask, top_k, num_steps, w_cfg)
+                          (SASRec, DreamRec, DreamRecText, DreamRecFMText).
         dataloader:       DataLoader для val или test split.
         top_k_values:     кортеж значений K для метрик.
-        num_sample_steps: число шагов Euler ODE при сэмплинге.
+        num_sample_steps: шагов сэмплинга (DDPM reverse или Euler ODE); SASRec игнорирует.
         w_cfg:            сила classifier-free guidance.
         device:           устройство.
         show_progress:    показывать tqdm прогресс-бар.
