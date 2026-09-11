@@ -7,10 +7,23 @@ Full-rank evaluation для sequential recommendation.
 Full-rank protocol — стандарт в современных работах по seq-rec
 (AlphaFuse, iDreamRec, SASRec). Sampled protocol даёт завышенные
 и несопоставимые числа.
+
+Оценка чекпойнта из командной строки (из корня проекта — пути в yaml относительные):
+
+    python src/evaluate.py --config configs/dreamrec.yaml --checkpoint checkpoints/dreamrec_1/best.pt
+    python src/evaluate.py --config ... --checkpoint ... --seeds 10 --splits test
+    python src/evaluate.py --self-test
+
+Метрики считаются по протоколу тренера (batch_size, шаги сэмплинга и w_cfg — из конфига)
+для сидов сэмплинга 42, 142, 242, ...; сид 42 воспроизводит val/test из лога обучения.
 """
 
 from __future__ import annotations
 
+import os
+os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
+
+import argparse
 import math
 
 import torch
@@ -148,15 +161,121 @@ def evaluate(
 
 
 # --------------------------------------------------------------------------- #
-# Quick sanity check
+# Оценка чекпойнта
 # --------------------------------------------------------------------------- #
 
-if __name__ == '__main__':
-    """
-    python -m src.evaluate
+# Тип модели → (модуль тренера, класс конфига); модель собирается его build_model
+MODELS = {
+    'SASRec':         ('train_sasrec',           'SASRecConfig'),
+    'DreamRec':       ('train_dreamrec',         'DreamRecConfig'),
+    'DreamRecText':   ('train_dreamrec_text',    'DreamRecTextConfig'),
+    'DreamRecFMText': ('train_dreamrec_fm_text', 'DreamRecFMTextConfig'),
+}
 
-    Проверяем метрики на случайных предсказаниях и на идеальных предсказаниях.
+
+def _detect_model(ckpt: dict) -> str:
+    name = (ckpt.get('model_cfg') or {}).get('model')
+    if name:
+        return name
+    if any(k.startswith('blocks.') for k in ckpt['model_state']):     # у SASRec model_cfg пустой
+        return 'SASRec'
+    raise ValueError('Не удалось определить тип модели по чекпойнту — укажите --model')
+
+
+def evaluate_checkpoint(
+    config_path: str,
+    checkpoint_path: str,
+    n_seeds: int = 5,
+    splits: tuple[str, ...] = ('val', 'test'),
+    model_name: str | None = None,
+) -> dict:
     """
+    Метрики чекпойнта по протоколу тренера для n_seeds сидов сэмплинга.
+
+    Returns:
+        {'model', 'epoch', 'saved_metrics', 'seeds', 'results': {split: {метрика: [по сидам]}}}
+    """
+    # Импорт здесь, а не наверху: training сам импортирует evaluate
+    import importlib
+    from config import load_config
+    from data import build_dataloaders
+    from training import EVAL_SEED, seeded
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    ckpt = torch.load(checkpoint_path, map_location='cpu', mmap=True)
+    model_name = model_name or _detect_model(ckpt)
+    module_name, config_cls = MODELS[model_name]
+    trainer = importlib.import_module(module_name)
+    cfg = load_config(config_path, getattr(trainer, config_cls))
+
+    model = trainer.build_model(cfg)
+    model.load_state_dict(ckpt['model_state'])      # строго: архитектура в yaml должна совпадать
+    model = model.to(device).eval()
+
+    saved_cfg = ckpt.get('model_cfg') or {}
+    if hasattr(model, 'config') and saved_cfg:
+        diff = {k: (saved_cfg.get(k), v) for k, v in model.config().items() if saved_cfg.get(k) != v}
+        if diff:
+            print(f'Конфиг отличается от чекпойнта (в чекпойнте → в конфиге): {diff}')
+
+    loaders = build_dataloaders(cfg.data.data_dir, batch_size=cfg.data.batch_size, num_workers=0,
+                                seq_len=cfg.data.max_seq_len, splits=splits)
+    seeds = [EVAL_SEED + 100 * i for i in range(n_seeds)]
+    results = {}
+    for split in splits:
+        runs = []
+        for seed in seeds:
+            with seeded(seed, device):
+                runs.append(evaluate(model, loaders[split], top_k_values=cfg.eval.top_k,
+                                     num_sample_steps=cfg.eval.num_sample_steps or 1,
+                                     w_cfg=getattr(cfg.model, 'w_cfg', 0.0),
+                                     device=device, show_progress=False))
+        results[split] = {metric: [run[metric] for run in runs] for metric in runs[0]}
+
+    return {'model': model_name, 'epoch': ckpt.get('epoch'), 'saved_metrics': ckpt.get('metrics'),
+            'seeds': seeds, 'results': results}
+
+
+def _t_quantile_975(df: int) -> float:
+    """Квантиль 0.975 t-распределения (для 95% доверительного интервала)."""
+    try:
+        from scipy.stats import t
+        return float(t.ppf(0.975, df))
+    except ImportError:
+        table = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571,
+                 6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228}
+        return table.get(df, 1.96)
+
+
+def _print_report(report: dict, checkpoint_path: str) -> None:
+    seeds, n = report['seeds'], len(report['seeds'])
+    print(f'\n{report["model"]} | {checkpoint_path} | эпоха {report["epoch"]} | сиды {seeds}')
+    for split, metrics in report['results'].items():
+        print(f'\n=== {split} ===')
+        print(f'  {"":8s} {"по сидам":>{9 * n}s}   {"mean ± std":>17s}   95% ДИ')
+        for metric, values in metrics.items():
+            mean = sum(values) / n
+            per_seed = ' '.join(f'{v:8.4f}' for v in values)
+            if n > 1:
+                std  = math.sqrt(sum((v - mean) ** 2 for v in values) / (n - 1))
+                half = _t_quantile_975(n - 1) * std / math.sqrt(n)
+                print(f'  {metric:8s} {per_seed}   {mean:.4f} ± {std:.4f}   [{mean - half:.4f}, {mean + half:.4f}]')
+            else:
+                print(f'  {metric:8s} {per_seed}   {mean:.4f}')
+
+    saved = report['saved_metrics'] or {}
+    if 'val' in report['results'] and 'NDCG@20' in saved:
+        first = report['results']['val']['NDCG@20'][0]
+        print(f'\nПроверка: val NDCG@20 при сиде {seeds[0]} = {first:.4f}, в чекпойнте {saved["NDCG@20"]:.4f}')
+    print('ДИ отражает только шум сэмплинга: разброс между обучениями с разными сидами он не учитывает.')
+
+
+# --------------------------------------------------------------------------- #
+# Самопроверка формул метрик
+# --------------------------------------------------------------------------- #
+
+def _self_test() -> None:
+    """Проверяем метрики на случайных и на идеальных предсказаниях."""
     torch.manual_seed(0)
 
     N_USERS = 1000
@@ -257,3 +376,33 @@ if __name__ == '__main__':
     print(f'  hit_ratio and ndcg correct for single user  OK')
 
     print('\nAll checks passed')
+
+
+# --------------------------------------------------------------------------- #
+# Entry point
+# --------------------------------------------------------------------------- #
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description='Метрики чекпойнта на val/test по протоколу тренера с разбросом по сидам сэмплинга.')
+    parser.add_argument('--config', help='yaml, с которым обучалась модель (configs/...)')
+    parser.add_argument('--checkpoint', help='путь к best.pt или latest.pt')
+    parser.add_argument('--seeds', type=int, default=5, help='число сидов сэмплинга: 42, 142, 242, ... (по умолчанию 5)')
+    parser.add_argument('--splits', nargs='+', default=['val', 'test'], choices=['val', 'test'])
+    parser.add_argument('--model', choices=list(MODELS), help='тип модели, если он не записан в чекпойнте')
+    parser.add_argument('--self-test', action='store_true', help='проверить формулы HR/NDCG и выйти')
+    args = parser.parse_args()
+
+    if args.self_test:
+        _self_test()
+        return
+    if not args.config or not args.checkpoint:
+        parser.error('нужны --config и --checkpoint (или --self-test)')
+
+    report = evaluate_checkpoint(args.config, args.checkpoint, n_seeds=args.seeds,
+                                 splits=tuple(args.splits), model_name=args.model)
+    _print_report(report, args.checkpoint)
+
+
+if __name__ == '__main__':
+    main()

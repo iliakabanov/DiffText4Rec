@@ -1,498 +1,248 @@
 """
-DreamRec: Unleashing Large Language Models for Sequential Recommendation
-(Wang et al., 2023) — реализация для ATG датасета.
+Генеративные рекомендеры в стиле DreamRec (Wang et al., 2023): история пользователя →
+conditioning h → генеративный процесс восстанавливает из шума эмбеддинг следующего
+товара (oracle) → top-K ближайших товаров.
 
-Ключевые особенности:
-    - Item embeddings обучаются с нуля (в отличие от frozen TEM в DreamRecText)
-    - x_start parameterization: денойзер предсказывает чистый эмбеддинг z_0
-    - Линейный денойзер: concat([x_t, h, t_emb]) → Linear(3d, d)
-    - Стохастический DDPM reverse process (не DDIM)
-    - CFG: обучаемый none_embedding
+Модель собрана из частей (models/components.py, models/processes.py):
 
-Совместим с evaluate() через recommend(history, mask, top_k, num_steps, w_cfg).
+    items     — эмбеддинги товаров           ItemEmbedding
+    encoder   — история → h                  HistoryEncoder
+    denoiser  — сеть f(x, h, τ) + CFG        ConcatDenoiser
+    process   — зашумление, loss, сэмплинг   DDPM | FlowMatching
+
+Три модели различаются только частями:
+
+    DreamRec        обучаемые ID-эмбеддинги        + DDPM
+    DreamRecText    замороженные текстовые (TEM)   + DDPM
+    DreamRecFMText  замороженные текстовые (TEM)   + Flow Matching
+
+Совместимы с evaluate() через recommend(history, mask, top_k, num_steps, w_cfg).
 """
 
 from __future__ import annotations
 
-import math
+from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.sasrec import SASRecBlock
-from models.time_embedding import sinusoidal_embedding
+from models.components import ConcatDenoiser, HistoryEncoder, ItemEmbedding
+from models.processes import DDPM, FlowMatching
+
+RETRIEVAL_METRICS = ('cosine', 'dot', 'l2')
 
 
-# --------------------------------------------------------------------------- #
-# Noise schedules
-# --------------------------------------------------------------------------- #
-
-def _exp_schedule(T: int, beta_min: float = 0.1, beta_max: float = 10.0) -> torch.Tensor:
-    """Экспоненциальный schedule (дефолт DreamRec)."""
-    t = torch.arange(1, T + 1, dtype=torch.float64)
-    betas = 1.0 - torch.exp(-beta_min / T - t / T ** 2 * (beta_max - beta_min))
-    return betas.clamp(0.0, 0.999).float()
-
-
-def _linear_schedule(T: int, beta_start: float = 1e-4, beta_end: float = 0.02) -> torch.Tensor:
-    return torch.linspace(beta_start, beta_end, T)
+def retrieve(oracle: torch.Tensor, items: torch.Tensor, metric: str, top_k: int) -> torch.LongTensor:
+    """Top-K товаров, ближайших к oracle-эмбеддингу (B, d) среди items (N, d)."""
+    if metric == 'cosine':
+        scores = F.normalize(oracle, dim=-1) @ F.normalize(items, dim=-1).T
+    elif metric == 'dot':
+        scores = oracle @ items.T
+    else:   # l2: ‖o − w‖² = ‖o‖² − 2·o·w + ‖w‖², ‖o‖² не влияет на порядок
+        scores = 2.0 * oracle @ items.T - items.pow(2).sum(-1)
+    return scores.topk(top_k, dim=-1).indices
 
 
-def _cosine_schedule(T: int) -> torch.Tensor:
-    t = torch.linspace(0, T, T + 1) / T
-    f = torch.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2
-    alphas_cumprod = (f / f[0]).clamp(min=1e-8)
-    betas = (1.0 - alphas_cumprod[1:] / alphas_cumprod[:-1]).clamp(0.0, 0.999)
-    return betas.float()
-
-
-def _make_schedule(name: str, T: int) -> torch.Tensor:
-    if name == 'exp':
-        return _exp_schedule(T)
-    if name == 'linear':
-        return _linear_schedule(T)
-    if name == 'cosine':
-        return _cosine_schedule(T)
-    raise ValueError(f'Unknown beta_schedule: {name!r}')
-
-
-# --------------------------------------------------------------------------- #
-# DreamRec
-# --------------------------------------------------------------------------- #
-
-class DreamRec(nn.Module):
+class GenerativeRecommender(nn.Module):
     """
-    DreamRec для sequential recommendation на ATG датасете.
+    Общая модель: items + encoder + denoiser + process.
 
     Args:
-        n_items:       число товаров (без padding).
-        padding_idx:   padding token index (= n_items).
-        d_model:       размерность всех эмбеддингов и скрытых состояний.
-        n_heads:       число голов self-attention в истории-энкодере.
-        d_ff:          ширина FFN в истории-энкодере.
-        dropout:       dropout в истории-энкодере и positional emb.
-        max_seq_len:   максимальная длина истории.
-        T:             число шагов диффузии.
-        beta_schedule: 'exp' (дефолт), 'linear', 'cosine'.
-        p_uncond:      вероятность заменить h на none_embedding при обучении.
-        w_cfg:         сила Classifier-Free Guidance при инференсе.
+        p_uncond:         вероятность CFG dropout (h → null_token) на обучении.
+        w_cfg:            сила classifier-free guidance на инференсе (0 — без guidance).
+        retrieval_metric: 'cosine', 'dot' или 'l2'.
     """
 
     def __init__(
         self,
-        n_items: int = 11924,
-        padding_idx: int = 11924,
-        d_model: int = 64,
-        n_heads: int = 1,
-        d_ff: int = 256,
-        dropout: float = 0.1,
-        max_seq_len: int = 10,
-        T: int = 200,
-        beta_schedule: str = 'exp',
-        p_uncond: float = 0.1,
-        w_cfg: float = 2.0,
-        retrieval_metric: str = 'l2',   # 'l2', 'dot', 'cosine'
+        items: ItemEmbedding,
+        encoder: HistoryEncoder,
+        denoiser: ConcatDenoiser,
+        process: DDPM | FlowMatching,
+        p_uncond: float,
+        w_cfg: float,
+        retrieval_metric: str,
     ):
         super().__init__()
-
-        self.n_items          = n_items
-        self.padding_idx      = padding_idx
-        self.d_model          = d_model
-        self.T                = T
-        self.p_uncond         = p_uncond
-        self.w_cfg            = w_cfg
+        if retrieval_metric not in RETRIEVAL_METRICS:
+            raise ValueError(f'retrieval_metric должен быть одним из {RETRIEVAL_METRICS}, получено {retrieval_metric!r}')
+        self.items    = items
+        self.encoder  = encoder
+        self.denoiser = denoiser
+        self.process  = process
+        self.p_uncond = p_uncond
+        self.w_cfg    = w_cfg
         self.retrieval_metric = retrieval_metric
 
-        # ------------------------------------------------------------------ #
-        # Embeddings
-        # ------------------------------------------------------------------ #
-        self.item_embedding = nn.Embedding(n_items + 1, d_model, padding_idx=padding_idx)
-        self.pos_embedding  = nn.Embedding(max_seq_len, d_model)
-        # Unconditional token — используется вместо h при CFG.
-        # padding_idx=0 делает вектор ВСЕГДА нулевым (frozen, не обучается),
-        # что соответствует оригинальному DreamRec. Денойзер явно обучается
-        # работать с нулевым conditioning при CFG dropout.
-        self.none_embedding = nn.Embedding(1, d_model, padding_idx=0)
-        self.dropout_emb    = nn.Dropout(dropout)
+    @property
+    def d_emb(self) -> int:
+        return self.items.d_emb
 
-        # ------------------------------------------------------------------ #
-        # History encoder (1 SASRec блок, pre-norm, каузальный)
-        # ------------------------------------------------------------------ #
-        self.encoder_block = SASRecBlock(d_model, n_heads, d_ff, dropout)
-        self.encoder_norm  = nn.LayerNorm(d_model)
+    @property
+    def n_items(self) -> int:
+        return self.items.n_items
 
-        # ------------------------------------------------------------------ #
-        # Timestep MLP: sinusoidal(d) → Linear(d,2d) → GELU → Linear(2d,d)
-        # ------------------------------------------------------------------ #
-        self.time_mlp = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
-            nn.GELU(),
-            nn.Linear(d_model * 2, d_model),
-        )
+    def encode_history(self, history: torch.LongTensor, mask: torch.FloatTensor) -> torch.Tensor:
+        """(B, L) индексы товаров, (B, L) маска → h (B, d_emb)."""
+        return self.encoder(self.items(history), mask)
 
-        # ------------------------------------------------------------------ #
-        # Denoiser: concat([x, h, t]) → Linear(3d, d)
-        # ------------------------------------------------------------------ #
-        self.denoiser = nn.Sequential(
-            nn.Linear(d_model * 3, d_model),
-        )
-
-        # ------------------------------------------------------------------ #
-        # Noise schedule buffers
-        # ------------------------------------------------------------------ #
-        betas = _make_schedule(beta_schedule, T)
-        alphas            = 1.0 - betas
-        alphas_cumprod    = torch.cumprod(alphas, dim=0)
-        alphas_cumprod_prev = torch.cat([torch.tensor([1.0]), alphas_cumprod[:-1]])
-
-        self.register_buffer('betas',                         betas)
-        self.register_buffer('alphas_cumprod',                alphas_cumprod)
-        self.register_buffer('sqrt_alphas_cumprod',           alphas_cumprod.sqrt())
-        self.register_buffer('sqrt_one_minus_alphas_cumprod', (1.0 - alphas_cumprod).sqrt())
-
-        # Posterior mean coefficients для reverse process (x_start parameterization)
-        # mean = coef1 * x_start + coef2 * x_t
-        coef1 = alphas_cumprod_prev.sqrt() * betas / (1.0 - alphas_cumprod)
-        coef2 = alphas.sqrt() * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
-        self.register_buffer('posterior_mean_coef1', coef1)
-        self.register_buffer('posterior_mean_coef2', coef2)
-
-        # Posterior variance: clamp чтобы избежать log(0) на первом шаге
-        post_var = (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod) * betas
-        self.register_buffer('posterior_variance', post_var.clamp(min=1e-20))
-
-        self._init_weights()
-
-    # ---------------------------------------------------------------------- #
-    # Init
-    # ---------------------------------------------------------------------- #
-
-    def _init_weights(self) -> None:
-        nn.init.normal_(self.item_embedding.weight, 0.0, 1.0)
-        with torch.no_grad():
-            self.item_embedding.weight[self.padding_idx].zero_()
-        nn.init.zeros_(self.pos_embedding.weight)
-        # none_embedding: не инициализируем — padding_idx=0 держит его нулевым
-        for m in [self.time_mlp, self.denoiser]:
-            for layer in m:
-                if isinstance(layer, nn.Linear):
-                    nn.init.xavier_uniform_(layer.weight)
-                    nn.init.zeros_(layer.bias)
-
-    # ---------------------------------------------------------------------- #
-    # History encoding
-    # ---------------------------------------------------------------------- #
-
-    def encode_history(
-        self,
-        history: torch.LongTensor,
-        mask: torch.FloatTensor,
-        apply_cfg_dropout: bool = False,
-    ) -> torch.Tensor:
-        """
-        Кодирует историю в conditioning vector h.
-
-        Args:
-            history:            (B, L)
-            mask:               (B, L), 1=реальный, 0=padding
-            apply_cfg_dropout:  при True с вероятностью p_uncond заменяет h
-                                на none_embedding (только при обучении)
-
-        Returns:
-            h: (B, d_model)
-        """
-        B, L   = history.shape
-        device = history.device
-
-        x = self.item_embedding(history)                                 # (B, L, d)
-        x = x + self.pos_embedding(torch.arange(L, device=device))      # broadcast по B
-        x = self.dropout_emb(x)
-
-        causal_mask      = torch.triu(torch.ones(L, L, device=device, dtype=torch.bool), diagonal=1)
-        key_padding_mask = (mask == 0)
-
-        x = self.encoder_block(x, attn_mask=causal_mask, key_padding_mask=key_padding_mask)
-        x = self.encoder_norm(x)
-        x = torch.nan_to_num(x, nan=0.0)
-        h = x[:, -1, :]                                                  # (B, d)
-
-        if apply_cfg_dropout and self.training:
-            none_h    = self.none_embedding(torch.zeros(1, dtype=torch.long, device=device))
-            none_h    = none_h.expand(B, -1)                             # (B, d)
-            drop_mask = torch.rand(B, device=device) < self.p_uncond
-            h = torch.where(drop_mask.unsqueeze(-1), none_h, h)
-
-        return h
-
-    # ---------------------------------------------------------------------- #
-    # Denoiser
-    # ---------------------------------------------------------------------- #
-
-    def _time_embed(self, t: torch.LongTensor) -> torch.Tensor:
-        """t: (B,) LongTensor → (B, d_model) via sinusoidal + MLP."""
-        t_sin  = sinusoidal_embedding(t.float(), self.d_model)           # (B, d), t ∈ [0, T)
-        return self.time_mlp(t_sin)                                      # (B, d)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        h: torch.Tensor,
-        t: torch.LongTensor,
-    ) -> torch.Tensor:
-        """
-        Conditional denoiser: предсказывает x_start из (x_t, h, t).
-
-        Args:
-            x: (B, d) — зашумлённый эмбеддинг x_t
-            h: (B, d) — conditioning (history encoding)
-            t: (B,)   — timestep
-
-        Returns:
-            x_start_pred: (B, d)
-        """
-        t_emb = self._time_embed(t)                                      # (B, d)
-        return self.denoiser(torch.cat([x, h, t_emb], dim=-1))           # (B, d)
-
-    def forward_uncon(
-        self,
-        x: torch.Tensor,
-        t: torch.LongTensor,
-    ) -> torch.Tensor:
-        """Unconditional denoiser: использует none_embedding вместо h."""
-        B      = x.shape[0]
-        device = x.device
-        none_h = self.none_embedding(torch.zeros(1, dtype=torch.long, device=device))
-        none_h = none_h.expand(B, -1)
-        return self.forward(x, none_h, t)
-
-    # ---------------------------------------------------------------------- #
-    # Training
-    # ---------------------------------------------------------------------- #
-
-    def compute_loss(
-        self,
-        history: torch.LongTensor,
-        target: torch.LongTensor,
-        mask: torch.FloatTensor,
-    ) -> torch.Tensor:
-        """
-        DreamRec loss: MSE между предсказанным и реальным x_start.
-
-        L = E_{t,ε} || x_0 - f_θ(√ᾱ_t·x_0 + √(1-ᾱ_t)·ε, h, t) ||²
-        """
-        B      = history.shape[0]
-        device = history.device
-
-        z_0  = self.item_embedding(target)                               # (B, d) clean emb
-        t    = torch.randint(0, self.T, (B,), device=device)            # (B,)
-        eps  = torch.randn_like(z_0)
-
-        # Forward diffusion
-        sqrt_ab  = self.sqrt_alphas_cumprod[t].unsqueeze(1)
-        sqrt_1ab = self.sqrt_one_minus_alphas_cumprod[t].unsqueeze(1)
-        x_t = sqrt_ab * z_0 + sqrt_1ab * eps                            # (B, d)
-
-        # Conditioning (с CFG dropout)
-        h = self.encode_history(history, mask, apply_cfg_dropout=True)  # (B, d)
-
-        # Предсказываем x_start
-        x_pred = self.forward(x_t, h, t)                                 # (B, d)
-
-        return F.mse_loss(x_pred, z_0)
-
-    # ---------------------------------------------------------------------- #
-    # Inference
-    # ---------------------------------------------------------------------- #
+    def compute_loss(self, history: torch.LongTensor, target: torch.LongTensor,
+                     mask: torch.FloatTensor) -> torch.Tensor:
+        h = self.denoiser.drop_condition(self.encode_history(history, mask), self.p_uncond)
+        return self.process.loss(self.denoiser, self.items(target), h)
 
     @torch.no_grad()
-    def p_sample(
-        self,
-        x: torch.Tensor,
-        h: torch.Tensor,
-        t_idx: int,
-    ) -> torch.Tensor:
-        """
-        Один шаг DDPM reverse process с CFG.
-
-        Args:
-            x:     (B, d) — текущее состояние x_t
-            h:     (B, d) — conditioning
-            t_idx: int — timestep index (0..T-1)
-
-        Returns:
-            x_{t-1}: (B, d)
-        """
-        B      = x.shape[0]
-        device = x.device
-        t      = torch.full((B,), t_idx, dtype=torch.long, device=device)
-
-        # CFG: x_start = (1+w)*cond - w*uncond
-        # Без клэмпа: оригинальный DreamRec не ограничивает x_start,
-        # а clamp(-5,5) зажимал бы 16% значений при std(x_start)≈3.6
-        x_start_cond   = self.forward(x, h, t)
-        x_start_uncond = self.forward_uncon(x, t)
-        x_start = (1.0 + self.w_cfg) * x_start_cond - self.w_cfg * x_start_uncond
-
-        # Posterior mean: E[x_{t-1} | x_t, x_0]
-        coef1     = self.posterior_mean_coef1[t_idx]
-        coef2     = self.posterior_mean_coef2[t_idx]
-        model_mean = coef1 * x_start + coef2 * x                        # (B, d)
-
-        if t_idx == 0:
-            return model_mean
-
-        # Добавляем стохастический шум (DDPM, не DDIM)
-        post_var = self.posterior_variance[t_idx]
-        noise    = torch.randn_like(x)
-        return model_mean + post_var.sqrt() * noise
+    def sample(self, h: torch.Tensor, num_steps: int | None = None,
+               w_cfg: float | None = None) -> torch.Tensor:
+        """Oracle-эмбеддинг из шума; w_cfg=None — self.w_cfg."""
+        w = self.w_cfg if w_cfg is None else w_cfg
+        return self.process.sample(self.denoiser, h, num_steps, w)
 
     @torch.no_grad()
-    def sample(
-        self,
-        h: torch.Tensor,
-        num_steps: int | None = None,
-    ) -> torch.Tensor:
-        """
-        DDPM reverse process от x_T до x_0.
+    def recommend(self, history: torch.LongTensor, mask: torch.FloatTensor, top_k: int = 20,
+                  num_steps: int | None = None, w_cfg: float | None = None) -> torch.LongTensor:
+        """История → oracle → top_k индексов товаров (B, top_k)."""
+        oracle = self.sample(self.encode_history(history, mask), num_steps, w_cfg)
+        return retrieve(oracle, self.items.table, self.retrieval_metric, top_k)
 
-        Args:
-            h:         (B, d) — conditioning.
-            num_steps: None или >= T — полная цепочка по всем T шагам (оригинал).
-                       < T — respaced ancestral DDPM: тот же стохастический процесс,
-                       но по равномерно прорежённой сетке из num_steps таймстепов
-                       (posterior-коэффициенты пересчитываются под подвыборку).
-
-        Returns:
-            x_0: (B, d) — predicted clean embedding.
-        """
-        if num_steps is None or num_steps >= self.T:
-            x = torch.randn_like(h)
-            for t_idx in reversed(range(self.T)):
-                x = self.p_sample(x, h, t_idx)
-            return x
-        return self._sample_respaced(h, num_steps)
-
-    @torch.no_grad()
-    def _sample_respaced(self, h: torch.Tensor, num_steps: int) -> torch.Tensor:
-        """Respaced ancestral DDPM по num_steps таймстепам (num_steps < T)."""
-        device = h.device
-        B      = h.shape[0]
-
-        # Равномерная подвыборка таймстепов из [0, T-1]
-        S = torch.linspace(0, self.T - 1, num_steps, device=device).round().long()
-        S = torch.unique(S)                                   # по возрастанию, без дублей
-
-        # Posterior-коэффициенты для прорежённой сетки
-        ac      = self.alphas_cumprod[S]                      # (k,) ᾱ на выбранных шагах
-        ac_prev = torch.cat([ac.new_ones(1), ac[:-1]])        # ᾱ предыдущего выбранного шага
-        betas   = 1.0 - ac / ac_prev
-        alphas  = 1.0 - betas
-        coef1    = ac_prev.sqrt() * betas / (1.0 - ac)
-        coef2    = alphas.sqrt() * (1.0 - ac_prev) / (1.0 - ac)
-        post_var = ((1.0 - ac_prev) / (1.0 - ac) * betas).clamp(min=1e-20)
-
-        x = torch.randn_like(h)
-        for i in reversed(range(len(S))):
-            t = torch.full((B,), int(S[i].item()), dtype=torch.long, device=device)
-
-            # CFG на предсказании x_start (как в p_sample)
-            x_start = self.forward(x, h, t)
-            if self.w_cfg != 0.0:
-                x_start_uncond = self.forward_uncon(x, t)
-                x_start = (1.0 + self.w_cfg) * x_start - self.w_cfg * x_start_uncond
-
-            model_mean = coef1[i] * x_start + coef2[i] * x
-            if i == 0:
-                x = model_mean
-            else:
-                x = model_mean + post_var[i].sqrt() * torch.randn_like(x)
-        return x
-
-    @torch.no_grad()
-    def recommend(
-        self,
-        history: torch.LongTensor,
-        mask: torch.FloatTensor,
-        top_k: int = 20,
-        num_steps: int | None = None,   # игнорируется, для совместимости с evaluate()
-        w_cfg: float | None = None,     # игнорируется (используется self.w_cfg)
-    ) -> torch.LongTensor:
-        """Полный pipeline: history → sample → top-K retrieval."""
-        h      = self.encode_history(history, mask, apply_cfg_dropout=False)
-        oracle = self.sample(h, num_steps=num_steps)                     # (B, d)
-        W      = self.item_embedding.weight[:self.n_items]               # (n_items, d)
-
-        if self.retrieval_metric == 'cosine':
-            scores = F.normalize(oracle, dim=-1) @ F.normalize(W, dim=-1).T
-            return scores.topk(top_k, dim=-1).indices
-        elif self.retrieval_metric == 'dot':
-            scores = oracle @ W.T
-            return scores.topk(top_k, dim=-1).indices
-        else:  # 'l2'
-            l2_sq = (oracle.pow(2).sum(-1, keepdim=True)
-                     - 2.0 * oracle @ W.T
-                     + W.pow(2).sum(-1).unsqueeze(0))
-            return l2_sq.topk(top_k, dim=-1, largest=False).indices
+    def config(self) -> dict:
+        """Параметры модели для чекпойнта (model_cfg) — их читают ноутбуки анализа."""
+        return {
+            'model': type(self).__name__,
+            'n_items': self.n_items,
+            'd_emb': self.d_emb,
+            **self.items.info,
+            **self.process.config(),
+            'p_uncond': self.p_uncond,
+            'w_cfg': self.w_cfg,
+            'retrieval_metric': self.retrieval_metric,
+        }
 
     def param_summary(self) -> dict:
-        total = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        return {'total_trainable': total, 'total_frozen': 0}
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        frozen    = sum(p.numel() for p in self.parameters() if not p.requires_grad)
+        return {'total_trainable': trainable, 'total_frozen': frozen}
 
 
 # --------------------------------------------------------------------------- #
-# Quick sanity check
+# Модели
+# --------------------------------------------------------------------------- #
+
+class DreamRec(GenerativeRecommender):
+    """DreamRec: ID-эмбеддинги товаров обучаются с нуля, процесс — DDPM."""
+
+    def __init__(self, *, n_items: int, padding_idx: int, d_emb: int, n_heads: int, d_ff: int,
+                 dropout: float, max_seq_len: int, T: int, beta_schedule: str,
+                 p_uncond: float, w_cfg: float, retrieval_metric: str):
+        super().__init__(
+            items=ItemEmbedding.learned(n_items, d_emb, padding_idx),
+            encoder=HistoryEncoder(d_emb, n_heads, d_ff, dropout, max_seq_len),
+            denoiser=ConcatDenoiser(d_emb),
+            process=DDPM(T, beta_schedule),
+            p_uncond=p_uncond, w_cfg=w_cfg, retrieval_metric=retrieval_metric,
+        )
+
+
+class DreamRecText(GenerativeRecommender):
+    """DreamRec на замороженных текстовых эмбеддингах товаров (TEM), процесс — DDPM."""
+
+    def __init__(self, *, item_embeddings_raw: np.ndarray, padding_idx: int, use_pca: bool,
+                 n_components: int, per_component_whitening: bool, whitening_cache: str | Path,
+                 n_heads: int, d_ff: int, dropout: float, max_seq_len: int,
+                 T: int, beta_schedule: str, p_uncond: float, w_cfg: float, retrieval_metric: str):
+        items = ItemEmbedding.text(item_embeddings_raw, padding_idx, use_pca, n_components,
+                                   per_component_whitening, whitening_cache)
+        super().__init__(
+            items=items,
+            encoder=HistoryEncoder(items.d_emb, n_heads, d_ff, dropout, max_seq_len),
+            denoiser=ConcatDenoiser(items.d_emb),
+            process=DDPM(T, beta_schedule),
+            p_uncond=p_uncond, w_cfg=w_cfg, retrieval_metric=retrieval_metric,
+        )
+
+
+class DreamRecFMText(GenerativeRecommender):
+    """DreamRecText с Flow Matching вместо DDPM."""
+
+    def __init__(self, *, item_embeddings_raw: np.ndarray, padding_idx: int, use_pca: bool,
+                 n_components: int, per_component_whitening: bool, whitening_cache: str | Path,
+                 n_heads: int, d_ff: int, dropout: float, max_seq_len: int,
+                 p_uncond: float, w_cfg: float, retrieval_metric: str):
+        items = ItemEmbedding.text(item_embeddings_raw, padding_idx, use_pca, n_components,
+                                   per_component_whitening, whitening_cache)
+        super().__init__(
+            items=items,
+            encoder=HistoryEncoder(items.d_emb, n_heads, d_ff, dropout, max_seq_len),
+            denoiser=ConcatDenoiser(items.d_emb),
+            process=FlowMatching(),
+            p_uncond=p_uncond, w_cfg=w_cfg, retrieval_metric=retrieval_metric,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Quick sanity check:  cd src && python -m models.dreamrec
 # --------------------------------------------------------------------------- #
 
 if __name__ == '__main__':
     import os
+    import tempfile
     os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
+    from models.components import TIME_STEPS, sinusoidal_embedding
 
     torch.manual_seed(0)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f'Device: {device}')
+    N_ITEMS, B, L, D = 100, 4, 10, 16
+    common = dict(padding_idx=N_ITEMS, n_heads=2, d_ff=32, dropout=0.1, max_seq_len=L,
+                  p_uncond=0.5, w_cfg=1.0, retrieval_metric='cosine')
+    emb_raw = np.random.default_rng(0).standard_normal((N_ITEMS, 32)).astype(np.float32)
 
-    N_ITEMS, PADDING, B, L = 11924, 11924, 4, 10
+    # Время: целые шаги различимы, у DDPM τ(t=0) = 1 (данные), τ(t=T−1) ≈ 0 (шум)
+    e = F.normalize(sinusoidal_embedding(torch.tensor([0.0, float(TIME_STEPS)]), 64), dim=-1)
+    assert (e[0] @ e[1]).item() < 0.5
+    ddpm = DDPM(1000, 'exp')
+    assert ddpm.tau(torch.tensor([0])).item() == 1.0 and ddpm.tau(torch.tensor([999])).item() < 0.01
+    print('time embedding / τ: OK')
 
-    model = DreamRec(
-        n_items=N_ITEMS, padding_idx=PADDING,
-        d_model=64, T=200,
-    ).to(device)
+    with tempfile.TemporaryDirectory() as tmp:
+        models = {
+            'DreamRec': DreamRec(n_items=N_ITEMS, d_emb=D, T=50, beta_schedule='exp', **common),
+            'DreamRecText (pca)': DreamRecText(item_embeddings_raw=emb_raw, use_pca=True, n_components=D,
+                                               per_component_whitening=True,
+                                               whitening_cache=Path(tmp) / 'wh.npz', T=50,
+                                               beta_schedule='exp', **common),
+            'DreamRecText (raw)': DreamRecText(item_embeddings_raw=emb_raw, use_pca=False, n_components=D,
+                                               per_component_whitening=True,
+                                               whitening_cache=Path(tmp) / 'wh.npz', T=50,
+                                               beta_schedule='linear', **common),
+            'DreamRecFMText': DreamRecFMText(item_embeddings_raw=emb_raw, use_pca=True, n_components=D,
+                                             per_component_whitening=False,
+                                             whitening_cache=Path(tmp) / 'wh.npz', **common),
+        }
+        history = torch.full((B, L), N_ITEMS, dtype=torch.long, device=device)
+        history[:, 5:] = torch.randint(0, N_ITEMS, (B, 5), device=device)
+        mask   = torch.zeros(B, L, device=device); mask[:, 5:] = 1.0
+        target = torch.randint(0, N_ITEMS, (B,), device=device)
 
-    print(f'Trainable params: {model.param_summary()["total_trainable"]:,}')
-
-    history = torch.full((B, L), PADDING, dtype=torch.long, device=device)
-    history[:, 5:] = torch.randint(0, N_ITEMS, (B, 5), device=device)
-    mask   = torch.zeros(B, L, device=device); mask[:, 5:] = 1.0
-    target = torch.randint(0, N_ITEMS, (B,), device=device)
-
-    # Test 1: loss
-    model.train()
-    loss = model.compute_loss(history, target, mask)
-    assert loss.shape == () and not torch.isnan(loss), f'Bad loss: {loss}'
-    loss.backward()
-    assert model.item_embedding.weight.grad is not None
-    assert model.item_embedding.weight.grad[PADDING].abs().max() == 0.0
-    print(f'compute_loss: {loss.item():.4f}  (grad OK)  OK')
-
-    # Test 2: recommend
-    model.eval()
-    recs = model.recommend(history, mask, top_k=20)
-    assert recs.shape == (B, 20)
-    assert (recs >= 0).all() and (recs < N_ITEMS).all()
-    print(f'recommend: {recs.shape}  OK')
-
-    # Test 3: noise schedule monotone
-    ab = model.alphas_cumprod
-    assert (ab[1:] <= ab[:-1]).all(), 'alphas_cumprod должен убывать'
-    print(f'noise schedule: ab[0]={ab[0]:.4f}, ab[-1]={ab[-1]:.6f}  OK')
-
-    # Test 4: no NaN in sample
-    model.eval()
-    with torch.no_grad():
-        h = model.encode_history(history, mask)
-        oracle = model.sample(h)
-    assert not torch.isnan(oracle).any(), 'NaN in oracle'
-    print(f'sample: {oracle.shape}, no NaN  OK')
+        for name, model in models.items():
+            model = model.to(device).train()
+            loss = model.compute_loss(history, target, mask)
+            loss.backward()
+            assert not torch.isnan(loss)
+            grad_items = model.items.embedding.weight.grad
+            if name == 'DreamRec':
+                assert grad_items is not None and grad_items[N_ITEMS].abs().max() == 0.0
+            else:
+                assert grad_items is None
+            assert model.encoder.block.parameters().__next__().grad is not None
+            model.eval()
+            for metric in RETRIEVAL_METRICS:
+                model.retrieval_metric = metric
+                recs = model.recommend(history, mask, top_k=5, num_steps=7)
+                assert recs.shape == (B, 5) and (recs < N_ITEMS).all()
+            print(f'{name:20s} d_emb={model.d_emb:3d} loss={loss.item():.4f} | '
+                  f'params {model.param_summary()} | config {model.config()}  OK')
 
     print('\nAll checks passed')

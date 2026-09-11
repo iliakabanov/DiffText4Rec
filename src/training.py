@@ -166,7 +166,7 @@ def _mean_loss(model: nn.Module, loader, device: torch.device, use_amp: bool) ->
 def fit(
     cfg: TrainConfig,
     build_model: Callable[[TrainConfig], nn.Module],
-    checkpoint_cfg: Callable[[nn.Module], dict] = lambda model: {},
+    checkpoint_cfg: Callable[[nn.Module], dict] | None = None,
     extra_val_metrics: dict[str, ExtraMetric] | None = None,
 ) -> dict[str, float]:
     """
@@ -175,8 +175,8 @@ def fit(
     Args:
         cfg:               конфиг (см. config.TrainConfig).
         build_model:       cfg -> модель; вызывается после set_seed и создания лоадеров.
-        checkpoint_cfg:    модель -> dict параметров, сохраняемый в чекпойнт (model_cfg),
-                           — его читают ноутбуки анализа.
+        checkpoint_cfg:    модель -> dict параметров для чекпойнта (model_cfg), его читают
+                           ноутбуки анализа; по умолчанию model.config(), если он есть.
         extra_val_metrics: доп. метрики валидации {имя: fn}, пишутся в log_val.csv.
     """
     extra_val_metrics = extra_val_metrics or {}
@@ -215,6 +215,10 @@ def fit(
     params = [p for p in model.parameters() if p.requires_grad]
     n_frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)
     print(f'{type(model).__name__}: trainable {sum(p.numel() for p in params):,}, frozen {n_frozen:,}')
+    if checkpoint_cfg is not None:
+        model_cfg = checkpoint_cfg(model)
+    else:
+        model_cfg = model.config() if hasattr(model, 'config') else {}
 
     optimizer = torch.optim.AdamW(params, lr=opt.lr, weight_decay=opt.weight_decay)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -279,7 +283,7 @@ def fit(
                         **extra, **metrics})
 
         ckpt = dict(model=model, epoch=epoch + 1, step=step, metrics=metrics,
-                    model_cfg=checkpoint_cfg(model))
+                    model_cfg=model_cfg)
         if metrics['NDCG@20'] > best_ndcg20:
             best_ndcg20 = metrics['NDCG@20']
             save_checkpoint(out_dir / 'best.pt', **ckpt)

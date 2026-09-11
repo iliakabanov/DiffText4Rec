@@ -1,5 +1,5 @@
 """
-Обучение DreamRec — эмбеддинги товаров (ID) обучаются с нуля.
+Обучение DreamRec — эмбеддинги товаров (ID) обучаются с нуля, процесс — DDPM.
 
 Запуск:
     python src/train_dreamrec.py --config configs/dreamrec.yaml
@@ -19,7 +19,7 @@ from training import run
 
 @dataclass
 class DreamRecModelConfig:
-    d_model:          int
+    d_emb:            int
     n_heads:          int
     d_ff:             int
     dropout:          float
@@ -27,7 +27,7 @@ class DreamRecModelConfig:
     beta_schedule:    str      # exp, linear, cosine
     p_uncond:         float
     w_cfg:            float
-    retrieval_metric: str      # l2, dot, cosine
+    retrieval_metric: str      # cosine, dot, l2
 
 
 @dataclass
@@ -40,7 +40,7 @@ def build_model(cfg: DreamRecConfig) -> DreamRec:
     return DreamRec(
         n_items=cfg.data.n_items,
         padding_idx=cfg.data.padding_idx,
-        d_model=m.d_model,
+        d_emb=m.d_emb,
         n_heads=m.n_heads,
         d_ff=m.d_ff,
         dropout=m.dropout,
@@ -53,17 +53,5 @@ def build_model(cfg: DreamRecConfig) -> DreamRec:
     )
 
 
-def checkpoint_cfg(model: DreamRec) -> dict:
-    """Параметры модели, которые ноутбуки читают из чекпойнта."""
-    return {
-        'n_items':          model.n_items,
-        'd_model':          model.d_model,
-        'T':                model.T,
-        'w_cfg':            model.w_cfg,
-        'p_uncond':         model.p_uncond,
-        'retrieval_metric': model.retrieval_metric,
-    }
-
-
 if __name__ == '__main__':
-    run(DreamRecConfig, build_model, 'dreamrec.yaml', checkpoint_cfg=checkpoint_cfg)
+    run(DreamRecConfig, build_model, 'dreamrec.yaml')

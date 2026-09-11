@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 from config import TextDataConfig, TrainConfig
 from data import load_item_embeddings
-from models.dreamrec_fm_text import DreamRecFMText
+from models.dreamrec import DreamRecFMText
 from training import run
 
 
@@ -31,7 +31,7 @@ class DreamRecFMTextModelConfig:
     dropout:                 float
     p_uncond:                float
     w_cfg:                   float
-    retrieval_metric:        str      # l2, dot, cosine
+    retrieval_metric:        str      # cosine, dot, l2
 
 
 @dataclass
@@ -50,7 +50,7 @@ def build_model(cfg: DreamRecFMTextConfig) -> DreamRecFMText:
         use_pca=m.use_pca,
         n_components=m.n_components,
         per_component_whitening=m.per_component_whitening,
-        whitening_cache_path=cfg.data.whitening_cache,
+        whitening_cache=cfg.data.whitening_cache,
         n_heads=m.n_heads,
         d_ff=m.d_ff,
         dropout=m.dropout,
@@ -61,18 +61,5 @@ def build_model(cfg: DreamRecFMTextConfig) -> DreamRecFMText:
     )
 
 
-def checkpoint_cfg(model: DreamRecFMText) -> dict:
-    """Параметры модели, которые ноутбуки читают из чекпойнта."""
-    return {
-        'n_items':                 model.n_items,
-        'd_emb':                   model.d_emb,
-        'use_pca':                 model.use_pca,
-        'per_component_whitening': model.per_component_whitening,
-        'w_cfg':                   model.w_cfg,
-        'p_uncond':                model.p_uncond,
-        'retrieval_metric':        model.retrieval_metric,
-    }
-
-
 if __name__ == '__main__':
-    run(DreamRecFMTextConfig, build_model, 'dreamrec_fm_text.yaml', checkpoint_cfg=checkpoint_cfg)
+    run(DreamRecFMTextConfig, build_model, 'dreamrec_fm_text.yaml')

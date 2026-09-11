@@ -275,6 +275,36 @@ def load_whitening(path: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray
     return data['mu'], data['V'], data['scale']
 
 
+def whitening_cache_path(base: str | Path, n_components: int, per_component: bool) -> Path:
+    """
+    Файл кэша для конкретной конфигурации: <base>_k<n>_<pc|global>.npz. Отдельный файл на
+    каждую конфигурацию — модели с разной размерностью не перезаписывают кэш друг у друга.
+    """
+    base = Path(base)
+    kind = 'pc' if per_component else 'global'
+    return base.with_name(f'{base.stem}_k{n_components}_{kind}{base.suffix}')
+
+
+def load_or_compute_whitening(
+    emb_raw: np.ndarray,
+    n_components: int,
+    cache_base: str | Path,
+    per_component: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(mu, V, scale) из кэша, иначе считает PCA + whitening по emb_raw и сохраняет в кэш."""
+    path = whitening_cache_path(cache_base, n_components, per_component)
+    if path.exists():
+        print(f'Loading whitening from cache: {path}')
+        return load_whitening(path)
+    print(f'Computing PCA {emb_raw.shape[1]}d -> {n_components}d (per_component={per_component})...')
+    mu, V, scale = compute_whitening(emb_raw.astype(np.float64), n_components=n_components,
+                                     per_component=per_component, verbose=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    save_whitening(path, mu, V, scale)
+    print(f'Cached to: {path}')
+    return mu, V, scale
+
+
 # --------------------------------------------------------------------------- #
 # Quick sanity check
 # --------------------------------------------------------------------------- #
