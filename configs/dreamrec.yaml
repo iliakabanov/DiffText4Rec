@@ -1,4 +1,5 @@
 seed: 42
+model_type: dreamrec
 
 data:
   data_dir: ./data/ATG
@@ -33,4 +34,4 @@ eval:
 
 output:
   dir: ./checkpoints
-  run_name: dreamrec_1
+  run_name: dreamrec

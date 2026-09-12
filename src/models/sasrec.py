@@ -114,6 +114,8 @@ class SASRec(nn.Module):
         self.n_items     = n_items
         self.padding_idx = padding_idx
         self.d_model     = d_model
+        self.n_heads     = n_heads
+        self.d_ff        = d_ff
         self.tie_weights = tie_weights
         self.loss        = loss
         self.neg_ratio   = neg_ratio
@@ -318,6 +320,21 @@ class SASRec(nn.Module):
             return h @ self.item_embedding.weight[:self.n_items].T
         else:
             return self.output_proj(h)
+
+    def config(self) -> dict:
+        """Параметры модели для чекпойнта (model_cfg) — их читают ноутбуки анализа."""
+        return {
+            'model': type(self).__name__,
+            'n_items': self.n_items,
+            'd_model': self.d_model,
+            'n_heads': self.n_heads,
+            'n_layers': len(self.blocks),
+            'd_ff': self.d_ff,
+            'tie_weights': self.tie_weights,
+            'loss': self.loss,
+            'neg_ratio': self.neg_ratio,
+            'temperature': self.temperature,
+        }
 
     def param_summary(self) -> dict:
         total = sum(p.numel() for p in self.parameters() if p.requires_grad)

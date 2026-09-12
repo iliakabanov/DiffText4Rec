@@ -1,4 +1,5 @@
 seed: 42
+model_type: dreamrec_fm_text
 
 data:
   data_dir: ./data/ATG
@@ -35,4 +36,4 @@ eval:
 
 output:
   dir: ./checkpoints
-  run_name: dreamrec_fm_text_1
+  run_name: dreamrec_fm_text

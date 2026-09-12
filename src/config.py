@@ -1,7 +1,7 @@
 """
 Загрузка yaml-конфигов в dataclass'ы.
 
-Dataclass'ы повторяют секции yaml (seed, data, model, optimizer, eval, output), поэтому
+Dataclass'ы повторяют секции yaml (seed, model_type, data, model, optimizer, eval, output), поэтому
 в коде параметры читаются как cfg.optimizer.lr, cfg.data.batch_size, cfg.model.T.
 
 Загрузка строгая: лишний ключ, отсутствующий ключ или значение не того типа — сразу
@@ -66,13 +66,17 @@ class OutputConfig:
 
 @dataclass
 class TrainConfig:
-    """Базовый конфиг обучения. Тренеры уточняют тип model (и data у текстовых моделей)."""
-    seed:      int
-    data:      DataConfig
-    model:     Any
-    optimizer: OptimizerConfig
-    eval:      EvalConfig
-    output:    OutputConfig
+    """
+    Базовый конфиг обучения. В builders.MODELS каждый тип модели уточняет тип model
+    (и data у моделей на текстовых эмбеддингах).
+    """
+    seed:       int
+    model_type: str            # ключ в builders.MODELS: какую модель собирать по этому конфигу
+    data:       DataConfig
+    model:      Any
+    optimizer:  OptimizerConfig
+    eval:       EvalConfig
+    output:     OutputConfig
 
 
 # --------------------------------------------------------------------------- #

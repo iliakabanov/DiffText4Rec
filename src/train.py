@@ -1,9 +1,13 @@
 """
-Общий цикл обучения для всех моделей (SASRec, DreamRec, DreamRecText, DreamRecFMText).
+Обучение любой модели из builders.MODELS — какой именно, сказано в yaml (model_type):
+
+    python src/training.py --config configs/dreamrec.yaml
+    python src/training.py --config configs/dreamrec_text.yaml
 
 От модели нужно:
-    compute_loss(history, target, mask)          -> скаляр
+    compute_loss(history, target, mask)               -> скаляр
     recommend(history, mask, top_k, num_steps, w_cfg) -> (B, top_k)   (вызывает evaluate())
+    config()                                          -> dict параметров, пишется в чекпойнт
 
 fit():
     - сид, данные (шаффл train — через отдельный генератор), модель, AdamW + линейный warmup;
@@ -24,6 +28,9 @@ fit():
 
 from __future__ import annotations
 
+import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
 import argparse
 import csv
 import random
@@ -36,14 +43,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from config import TrainConfig, load_config
+from builders import load_model_config
+from config import TrainConfig
 from data import build_dataloaders
 from evaluate import evaluate
 
 EVAL_SEED = 42
-
-# Доп. метрика на валидации: (model, loaders, device) -> float, пишется в log_val.csv
-ExtraMetric = Callable[[nn.Module, dict, torch.device], float]
 
 
 # --------------------------------------------------------------------------- #
@@ -166,20 +171,14 @@ def _mean_loss(model: nn.Module, loader, device: torch.device, use_amp: bool) ->
 def fit(
     cfg: TrainConfig,
     build_model: Callable[[TrainConfig], nn.Module],
-    checkpoint_cfg: Callable[[nn.Module], dict] | None = None,
-    extra_val_metrics: dict[str, ExtraMetric] | None = None,
 ) -> dict[str, float]:
     """
     Обучает модель по конфигу и возвращает метрики на test.
 
     Args:
-        cfg:               конфиг (см. config.TrainConfig).
-        build_model:       cfg -> модель; вызывается после set_seed и создания лоадеров.
-        checkpoint_cfg:    модель -> dict параметров для чекпойнта (model_cfg), его читают
-                           ноутбуки анализа; по умолчанию model.config(), если он есть.
-        extra_val_metrics: доп. метрики валидации {имя: fn}, пишутся в log_val.csv.
+        cfg:         конфиг (см. config.TrainConfig).
+        build_model: cfg -> модель; вызывается после set_seed и создания лоадеров.
     """
-    extra_val_metrics = extra_val_metrics or {}
     if 20 not in cfg.eval.top_k:
         raise ValueError(f'eval.top_k={cfg.eval.top_k} должен содержать 20: best.pt выбирается по NDCG@20')
 
@@ -215,10 +214,7 @@ def fit(
     params = [p for p in model.parameters() if p.requires_grad]
     n_frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)
     print(f'{type(model).__name__}: trainable {sum(p.numel() for p in params):,}, frozen {n_frozen:,}')
-    if checkpoint_cfg is not None:
-        model_cfg = checkpoint_cfg(model)
-    else:
-        model_cfg = model.config() if hasattr(model, 'config') else {}
+    model_cfg = model.config()      # в чекпойнт, его читают ноутбуки анализа
 
     optimizer = torch.optim.AdamW(params, lr=opt.lr, weight_decay=opt.weight_decay)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -274,13 +270,11 @@ def fit(
         model.eval()
         val_loss = _mean_loss(model, val_loader, device, use_amp)
         metrics  = run_eval(val_loader)
-        extra    = {name: round(fn(model, loaders, device), 6) for name, fn in extra_val_metrics.items()}
         model.train()
 
-        print(f'Val loss: {val_loss:.4f} | {metrics}'
-              + ''.join(f' | {name}: {value:.4f}' for name, value in extra.items()))
+        print(f'Val loss: {val_loss:.4f} | {metrics}')
         val_logger.log({'epoch': epoch + 1, 'step': step, 'val_loss': round(val_loss, 6),
-                        **extra, **metrics})
+                        **metrics})
 
         ckpt = dict(model=model, epoch=epoch + 1, step=step, metrics=metrics,
                     model_cfg=model_cfg)
@@ -302,22 +296,21 @@ def fit(
     test_metrics = run_eval(loaders['test'])
 
     print(f'Test: {test_metrics}')
-    # Пустые не-метрические поля: строка test совпадает по столбцам с заголовком
-    val_logger.log({'epoch': 'test', 'step': step, 'val_loss': '',
-                    **{name: '' for name in extra_val_metrics}, **test_metrics})
+    # Пустой val_loss: строка test совпадает по столбцам с заголовком
+    val_logger.log({'epoch': 'test', 'step': step, 'val_loss': '', **test_metrics})
     print('\nDone.')
     return test_metrics
 
 
-def run(
-    config_cls: type[TrainConfig],
-    build_model: Callable[[TrainConfig], nn.Module],
-    default_config: str,
-    **fit_kwargs,
-) -> dict[str, float]:
-    """Точка входа тренера: разбирает --config (по умолчанию configs/<default_config>) и вызывает fit()."""
-    parser = argparse.ArgumentParser()
-    default_path = Path(__file__).resolve().parent.parent / 'configs' / default_config
-    parser.add_argument('--config', type=str, default=str(default_path))
+def main() -> dict[str, float]:
+    """Точка входа: по model_type из yaml берёт модель из builders.MODELS и обучает её."""
+    parser = argparse.ArgumentParser(description='Обучение модели по yaml-конфигу.')
+    parser.add_argument('--config', required=True, help='configs/<модель>.yaml')
     args = parser.parse_args()
-    return fit(load_config(args.config, config_cls), build_model, **fit_kwargs)
+
+    spec, cfg = load_model_config(args.config)
+    return fit(cfg, spec.build)
+
+
+if __name__ == '__main__':
+    main()

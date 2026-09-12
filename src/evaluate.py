@@ -232,57 +232,36 @@ def evaluate_retrievals(
 # Оценка чекпойнта
 # --------------------------------------------------------------------------- #
 
-# Тип модели → (модуль тренера, класс конфига); модель собирается его build_model
-MODELS = {
-    'SASRec':         ('train_sasrec',           'SASRecConfig'),
-    'DreamRec':       ('train_dreamrec',         'DreamRecConfig'),
-    'DreamRecText':   ('train_dreamrec_text',    'DreamRecTextConfig'),
-    'DreamRecFMText': ('train_dreamrec_fm_text', 'DreamRecFMTextConfig'),
-}
-
-
-def _detect_model(ckpt: dict) -> str:
-    name = (ckpt.get('model_cfg') or {}).get('model')
-    if name:
-        return name
-    if any(k.startswith('blocks.') for k in ckpt['model_state']):     # у SASRec model_cfg пустой
-        return 'SASRec'
-    raise ValueError('Не удалось определить тип модели по чекпойнту — укажите --model')
-
-
 def evaluate_checkpoint(
     config_path: str,
     checkpoint_path: str,
     n_seeds: int = 5,
     splits: tuple[str, ...] = ('val', 'test'),
-    model_name: str | None = None,
 ) -> dict:
     """
     Метрики чекпойнта по протоколу тренера для n_seeds сидов сэмплинга.
+
+    Модель собирается по тому же конфигу, что и при обучении (builders.MODELS[model_type]).
 
     Returns:
         {'model', 'epoch', 'saved_metrics', 'seeds', 'retrieval_row',
          'results': {split: {строка таблицы: {метрика: [по сидам]}}}}
     """
-    # Импорт здесь, а не наверху: training сам импортирует evaluate
-    import importlib
-    from config import load_config
+    # Импорт здесь, а не наверху: train сам импортирует evaluate
+    from builders import load_model_config
     from data import build_dataloaders
-    from training import EVAL_SEED, seeded
+    from train import EVAL_SEED, seeded
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     ckpt = torch.load(checkpoint_path, map_location='cpu', mmap=True)
-    model_name = model_name or _detect_model(ckpt)
-    module_name, config_cls = MODELS[model_name]
-    trainer = importlib.import_module(module_name)
-    cfg = load_config(config_path, getattr(trainer, config_cls))
+    spec, cfg = load_model_config(config_path)
 
-    model = trainer.build_model(cfg)
+    model = spec.build(cfg)
     model.load_state_dict(ckpt['model_state'])      # строго: архитектура в yaml должна совпадать
     model = model.to(device).eval()
 
     saved_cfg = ckpt.get('model_cfg') or {}
-    if hasattr(model, 'config') and saved_cfg:
+    if saved_cfg:                                   # у старых чекпойнтов SASRec он пустой
         diff = {k: (saved_cfg.get(k), v) for k, v in model.config().items() if saved_cfg.get(k) != v}
         if diff:
             print(f'Конфиг отличается от чекпойнта (в чекпойнте → в конфиге): {diff}')
@@ -304,7 +283,7 @@ def evaluate_checkpoint(
 
     # Строка таблицы, соответствующая ретривалу из конфига (с ним считались метрики при обучении)
     by_metric = {metric: row for row, metric in RETRIEVAL_ROWS.items()}
-    return {'model': model_name, 'epoch': ckpt.get('epoch'), 'saved_metrics': ckpt.get('metrics'),
+    return {'model': cfg.model_type, 'epoch': ckpt.get('epoch'), 'saved_metrics': ckpt.get('metrics'),
             'seeds': seeds, 'retrieval_row': by_metric.get(getattr(cfg.model, 'retrieval_metric', None)),
             'results': results}
 
@@ -489,7 +468,6 @@ def main() -> None:
     parser.add_argument('--checkpoint', help='путь к best.pt или latest.pt')
     parser.add_argument('--seeds', type=int, default=5, help='число сидов сэмплинга: 42, 142, 242, ... (по умолчанию 5)')
     parser.add_argument('--splits', nargs='+', default=['val', 'test'], choices=['val', 'test'])
-    parser.add_argument('--model', choices=list(MODELS), help='тип модели, если он не записан в чекпойнте')
     parser.add_argument('--self-test', action='store_true', help='проверить формулы HR/NDCG и выйти')
     args = parser.parse_args()
 
@@ -500,7 +478,7 @@ def main() -> None:
         parser.error('нужны --config и --checkpoint (или --self-test)')
 
     report = evaluate_checkpoint(args.config, args.checkpoint, n_seeds=args.seeds,
-                                 splits=tuple(args.splits), model_name=args.model)
+                                 splits=tuple(args.splits))
     _print_report(report, args.checkpoint)
 
 
