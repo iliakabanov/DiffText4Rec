@@ -16,6 +16,8 @@ Full-rank protocol — стандарт в современных работах
 
 Метрики считаются по протоколу тренера (batch_size, шаги сэмплинга и w_cfg — из конфига)
 для сидов сэмплинга 42, 142, 242, ...; сид 42 воспроизводит val/test из лога обучения.
+Печатается таблица mean ± std: строки — способ ретривала (dot / cosine / L2) и случайный
+бейзлайн, столбцы — метрики. Все ретривалы считаются по одному и тому же oracle-эмбеддингу.
 """
 
 from __future__ import annotations
@@ -161,6 +163,72 @@ def evaluate(
 
 
 # --------------------------------------------------------------------------- #
+# Evaluation по всем способам ретривала
+# --------------------------------------------------------------------------- #
+
+# Строка таблицы → метрика ретривала в models.dreamrec.retrieve
+RETRIEVAL_ROWS = {'Dot Product': 'dot', 'Cosine Sim': 'cosine', 'L2 Distance': 'l2'}
+
+
+@torch.no_grad()
+def evaluate_retrievals(
+    model,
+    dataloader: DataLoader,
+    top_k_values: tuple[int, ...] = (10, 20),
+    num_sample_steps: int = 50,
+    w_cfg: float = 0.0,
+    device: str | torch.device = 'cuda',
+    show_progress: bool = False,
+) -> dict[str, dict[str, float]]:
+    """
+    Как evaluate(), но сразу по всем способам ретривала — для одного и того же сэмплинга
+    oracle, поэтому они сравнимы между собой — плюс случайный бейзлайн.
+
+    Для SASRec, который ранжирует товары сам, без oracle-эмбеддинга, строка одна.
+
+    Returns:
+        {строка таблицы: {метрика: значение}}
+    """
+    from models.dreamrec import retrieve        # локально: models тянет за собой whitening
+
+    model.eval()
+    max_k = max(top_k_values)
+    generative = hasattr(model, 'items') and hasattr(model, 'sample')
+
+    rankings: dict[str, list[torch.Tensor]] = {}
+    targets:  list[torch.Tensor] = []
+
+    iterator = tqdm(dataloader, desc='Eval', leave=False) if show_progress else dataloader
+    for batch in iterator:
+        history = batch['history'].to(device)
+        mask    = batch['mask'].to(device)
+        target  = batch['target'].to(device)
+
+        if generative:
+            oracle = model.sample(model.encode_history(history, mask),
+                                  num_steps=num_sample_steps, w_cfg=w_cfg)
+            batch_rankings = {name: retrieve(oracle, model.items.table, metric, max_k)
+                              for name, metric in RETRIEVAL_ROWS.items()}
+        else:
+            batch_rankings = {type(model).__name__: model.recommend(
+                history, mask, top_k=max_k, num_steps=num_sample_steps, w_cfg=w_cfg)}
+
+        batch_rankings['Random'] = torch.stack(
+            [torch.randperm(model.n_items, device=device)[:max_k] for _ in range(target.shape[0])])
+
+        for name, r in batch_rankings.items():
+            rankings.setdefault(name, []).append(r.cpu())
+        targets.append(target.cpu())
+
+    targets_all = torch.cat(targets)
+    return {
+        name: {f'{prefix}@{k}': fn(torch.cat(rs), targets_all, k)
+               for k in top_k_values for prefix, fn in (('HR', hit_ratio), ('NDCG', ndcg))}
+        for name, rs in rankings.items()
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Оценка чекпойнта
 # --------------------------------------------------------------------------- #
 
@@ -193,7 +261,8 @@ def evaluate_checkpoint(
     Метрики чекпойнта по протоколу тренера для n_seeds сидов сэмплинга.
 
     Returns:
-        {'model', 'epoch', 'saved_metrics', 'seeds', 'results': {split: {метрика: [по сидам]}}}
+        {'model', 'epoch', 'saved_metrics', 'seeds', 'retrieval_row',
+         'results': {split: {строка таблицы: {метрика: [по сидам]}}}}
     """
     # Импорт здесь, а не наверху: training сам импортирует evaluate
     import importlib
@@ -226,14 +295,18 @@ def evaluate_checkpoint(
         runs = []
         for seed in seeds:
             with seeded(seed, device):
-                runs.append(evaluate(model, loaders[split], top_k_values=cfg.eval.top_k,
-                                     num_sample_steps=cfg.eval.num_sample_steps or 1,
-                                     w_cfg=getattr(cfg.model, 'w_cfg', 0.0),
-                                     device=device, show_progress=False))
-        results[split] = {metric: [run[metric] for run in runs] for metric in runs[0]}
+                runs.append(evaluate_retrievals(model, loaders[split], top_k_values=cfg.eval.top_k,
+                                                num_sample_steps=cfg.eval.num_sample_steps or 1,
+                                                w_cfg=getattr(cfg.model, 'w_cfg', 0.0),
+                                                device=device, show_progress=False))
+        results[split] = {row: {metric: [run[row][metric] for run in runs] for metric in runs[0][row]}
+                          for row in runs[0]}
 
+    # Строка таблицы, соответствующая ретривалу из конфига (с ним считались метрики при обучении)
+    by_metric = {metric: row for row, metric in RETRIEVAL_ROWS.items()}
     return {'model': model_name, 'epoch': ckpt.get('epoch'), 'saved_metrics': ckpt.get('metrics'),
-            'seeds': seeds, 'results': results}
+            'seeds': seeds, 'retrieval_row': by_metric.get(getattr(cfg.model, 'retrieval_metric', None)),
+            'results': results}
 
 
 def _t_quantile_975(df: int) -> float:
@@ -247,27 +320,54 @@ def _t_quantile_975(df: int) -> float:
         return table.get(df, 1.96)
 
 
+def _mean_std(values: list[float]) -> tuple[float, float]:
+    n    = len(values)
+    mean = sum(values) / n
+    std  = math.sqrt(sum((v - mean) ** 2 for v in values) / (n - 1)) if n > 1 else 0.0
+    return mean, std
+
+
+def _format_table(rows: dict[str, dict[str, list[float]]]) -> str:
+    """Таблица 'mean ± std': строки — способ ретривала, столбцы — метрики."""
+    names   = list(rows)
+    metrics = list(next(iter(rows.values())))
+    cells   = {metric: [f'{_mean_std(rows[name][metric])[0]:.4f} ± {_mean_std(rows[name][metric])[1]:.4f}'
+                        for name in names]
+               for metric in metrics}
+    try:
+        import pandas as pd
+        df = pd.DataFrame(cells, index=names)
+        df.index.name = 'Retrieval'
+        return df.to_string()
+    except ImportError:
+        width = max(len(n) for n in names) + 2
+        head  = f'{"Retrieval":<{width}s}' + '  '.join(f'{m:>15s}' for m in metrics)
+        body  = '\n'.join(f'{name:<{width}s}' + '  '.join(f'{cells[m][i]:>15s}' for m in metrics)
+                          for i, name in enumerate(names))
+        return f'{head}\n{body}'
+
+
 def _print_report(report: dict, checkpoint_path: str) -> None:
     seeds, n = report['seeds'], len(report['seeds'])
-    print(f'\n{report["model"]} | {checkpoint_path} | эпоха {report["epoch"]} | сиды {seeds}')
-    for split, metrics in report['results'].items():
-        print(f'\n=== {split} ===')
-        print(f'  {"":8s} {"по сидам":>{9 * n}s}   {"mean ± std":>17s}   95% ДИ')
-        for metric, values in metrics.items():
-            mean = sum(values) / n
-            per_seed = ' '.join(f'{v:8.4f}' for v in values)
-            if n > 1:
-                std  = math.sqrt(sum((v - mean) ** 2 for v in values) / (n - 1))
-                half = _t_quantile_975(n - 1) * std / math.sqrt(n)
-                print(f'  {metric:8s} {per_seed}   {mean:.4f} ± {std:.4f}   [{mean - half:.4f}, {mean + half:.4f}]')
-            else:
-                print(f'  {metric:8s} {per_seed}   {mean:.4f}')
+    print(f'\n{report["model"]} | {checkpoint_path} | эпоха {report["epoch"]} | '
+          f'{n} сидов сэмплинга: {seeds}')
+
+    for split, rows in report['results'].items():
+        print(f'\n=== {split.upper()} ===')
+        print(_format_table(rows))
+        row = report.get('retrieval_row') or next(iter(rows))
+        if n > 1 and 'NDCG@20' in rows[row]:
+            mean, std = _mean_std(rows[row]['NDCG@20'])
+            half = _t_quantile_975(n - 1) * std / math.sqrt(n)
+            print(f'95% ДИ для NDCG@20 ({row}): [{mean - half:.4f}, {mean + half:.4f}]')
 
     saved = report['saved_metrics'] or {}
-    if 'val' in report['results'] and 'NDCG@20' in saved:
-        first = report['results']['val']['NDCG@20'][0]
-        print(f'\nПроверка: val NDCG@20 при сиде {seeds[0]} = {first:.4f}, в чекпойнте {saved["NDCG@20"]:.4f}')
-    print('ДИ отражает только шум сэмплинга: разброс между обучениями с разными сидами он не учитывает.')
+    val   = report['results'].get('val')
+    if val and 'NDCG@20' in saved:
+        row = report.get('retrieval_row') or next(iter(val))
+        print(f'\nПроверка: val NDCG@20 ({row}) при сиде {seeds[0]} = {val[row]["NDCG@20"][0]:.4f}, '
+              f'в чекпойнте {saved["NDCG@20"]:.4f}')
+    print('Разброс отражает только шум сэмплинга: различия между обучениями с разными сидами он не учитывает.')
 
 
 # --------------------------------------------------------------------------- #
