@@ -186,7 +186,7 @@ class SASRec(nn.Module):
         device = history.device
 
         # Embeddings
-        x = self.item_embedding(history)                                 # (B, L, d_model)
+        x = self.item_embedding(history)                                # (B, L, d_model)
         positions = torch.arange(L, device=device).unsqueeze(0)         # (1, L)
         x = x + self.pos_embedding(positions)                           # (B, L, d_model)
         x = self.dropout_emb(x)
