@@ -281,10 +281,13 @@ def evaluate_checkpoint(
         results[split] = {row: {metric: [run[row][metric] for run in runs] for metric in runs[0][row]}
                           for row in runs[0]}
 
-    # Строка таблицы, соответствующая ретривалу из конфига (с ним считались метрики при обучении)
+    # Строка таблицы, соответствующая ретривалу из конфига (с ним считались метрики при обучении);
+    # у SASRec строка одна — ранжирует сама модель по своему retrieval_metric
     by_metric = {metric: row for row, metric in RETRIEVAL_ROWS.items()}
+    retrieval_row = (by_metric.get(getattr(cfg.model, 'retrieval_metric', None))
+                     if hasattr(model, 'sample') else None)
     return {'model': cfg.model_type, 'epoch': ckpt.get('epoch'), 'saved_metrics': ckpt.get('metrics'),
-            'seeds': seeds, 'retrieval_row': by_metric.get(getattr(cfg.model, 'retrieval_metric', None)),
+            'seeds': seeds, 'retrieval_row': retrieval_row,
             'results': results}
 
 

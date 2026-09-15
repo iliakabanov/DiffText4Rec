@@ -23,8 +23,8 @@ import yaml
 
 from config import TextDataConfig, TrainConfig, load_config
 from data import load_item_embeddings
-from models.dreamrec import DreamRec, DreamRecFMText, DreamRecText
-from models.sasrec import SASRec
+from models.dreamrec import DreamRec, DreamRecAlphaFuse, DreamRecFMText, DreamRecText
+from models.sasrec import SASRec, SASRecAlphaFuse
 
 
 # --------------------------------------------------------------------------- #
@@ -42,6 +42,7 @@ class SASRecModelConfig:
     loss:        str
     neg_ratio:   int
     temperature: float
+    retrieval_metric: str         # cosine, dot
 
 
 @dataclass
@@ -64,11 +65,64 @@ def build_sasrec(cfg: SASRecConfig) -> SASRec:
         loss=m.loss,
         neg_ratio=m.neg_ratio,
         temperature=m.temperature,
+        retrieval_metric=m.retrieval_metric,
     )
 
 
 # --------------------------------------------------------------------------- #
-# DreamRec — эмбеддинги товаров (ID) обучаются с нуля, процесс DDPM
+# SASRecAlphaFuse — SASRec на эмбеддингах AlphaFuse
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class SASRecAlphaFuseModelConfig:
+    d_model:     int              # = n_components PCA семантики
+    null_dim:    int | None       # ровно одно из null_dim / null_thres
+    null_thres:  float | None     # порог на собственные значения ковариации сырых TEM
+    fusion:      str              # add — ID прибавляется к null-координатам; replace — заменяет их
+    id_init:     str              # normal, zeros
+    n_heads:     int
+    n_layers:    int
+    d_ff:        int
+    dropout:     float
+    loss:        str
+    neg_ratio:   int
+    temperature: float
+    retrieval_metric: str         # cosine, dot
+
+
+@dataclass
+class SASRecAlphaFuseConfig(TrainConfig):
+    data:  TextDataConfig
+    model: SASRecAlphaFuseModelConfig
+
+
+def build_sasrec_alphafuse(cfg: SASRecAlphaFuseConfig) -> SASRecAlphaFuse:
+    m = cfg.model
+    emb_raw = load_item_embeddings(cfg.data.emb_path)
+    print(f'Item embeddings: {emb_raw.shape}')
+    return SASRecAlphaFuse(
+        item_embeddings_raw=emb_raw,
+        padding_idx=cfg.data.padding_idx,
+        d_model=m.d_model,
+        null_dim=m.null_dim,
+        null_thres=m.null_thres,
+        fusion=m.fusion,
+        id_init=m.id_init,
+        whitening_cache=cfg.data.whitening_cache,
+        n_heads=m.n_heads,
+        n_layers=m.n_layers,
+        d_ff=m.d_ff,
+        dropout=m.dropout,
+        max_seq_len=cfg.data.max_seq_len,
+        loss=m.loss,
+        neg_ratio=m.neg_ratio,
+        temperature=m.temperature,
+        retrieval_metric=m.retrieval_metric,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# DreamRec —эмбеддинги товаров (ID) обучаются с нуля, процесс DDPM
 # --------------------------------------------------------------------------- #
 
 @dataclass
@@ -200,6 +254,58 @@ def build_dreamrec_fm_text(cfg: DreamRecFMTextConfig) -> DreamRecFMText:
 
 
 # --------------------------------------------------------------------------- #
+# DreamRecAlphaFuse — DreamRec на эмбеддингах AlphaFuse, процесс DDPM
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class DreamRecAlphaFuseModelConfig:
+    d_emb:            int              # = n_components PCA семантики
+    null_dim:         int | None       # ровно одно из null_dim / null_thres
+    null_thres:       float | None     # порог на собственные значения ковариации сырых TEM
+    fusion:           str              # add — ID прибавляется к null-координатам; replace — заменяет их
+    id_init:          str              # normal, zeros
+    n_heads:          int
+    d_ff:             int
+    dropout:          float
+    T:                int
+    beta_schedule:    str              # exp, linear, cosine
+    p_uncond:         float
+    w_cfg:            float
+    retrieval_metric: str              # cosine, dot, l2
+
+
+@dataclass
+class DreamRecAlphaFuseConfig(TrainConfig):
+    data:  TextDataConfig
+    model: DreamRecAlphaFuseModelConfig
+
+
+def build_dreamrec_alphafuse(cfg: DreamRecAlphaFuseConfig) -> DreamRecAlphaFuse:
+    m = cfg.model
+    emb_raw = load_item_embeddings(cfg.data.emb_path)
+    print(f'Item embeddings: {emb_raw.shape}')
+    return DreamRecAlphaFuse(
+        item_embeddings_raw=emb_raw,
+        padding_idx=cfg.data.padding_idx,
+        d_emb=m.d_emb,
+        null_dim=m.null_dim,
+        null_thres=m.null_thres,
+        fusion=m.fusion,
+        id_init=m.id_init,
+        whitening_cache=cfg.data.whitening_cache,
+        n_heads=m.n_heads,
+        d_ff=m.d_ff,
+        dropout=m.dropout,
+        max_seq_len=cfg.data.max_seq_len,
+        T=m.T,
+        beta_schedule=m.beta_schedule,
+        p_uncond=m.p_uncond,
+        w_cfg=m.w_cfg,
+        retrieval_metric=m.retrieval_metric,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Реестр
 # --------------------------------------------------------------------------- #
 
@@ -211,10 +317,12 @@ class ModelSpec:
 
 
 MODELS: dict[str, ModelSpec] = {
-    'sasrec':           ModelSpec(SASRecConfig,         build_sasrec),
-    'dreamrec':         ModelSpec(DreamRecConfig,       build_dreamrec),
-    'dreamrec_text':    ModelSpec(DreamRecTextConfig,   build_dreamrec_text),
-    'dreamrec_fm_text': ModelSpec(DreamRecFMTextConfig, build_dreamrec_fm_text),
+    'sasrec':             ModelSpec(SASRecConfig,            build_sasrec),
+    'sasrec_alphafuse':   ModelSpec(SASRecAlphaFuseConfig,   build_sasrec_alphafuse),
+    'dreamrec':           ModelSpec(DreamRecConfig,          build_dreamrec),
+    'dreamrec_text':      ModelSpec(DreamRecTextConfig,      build_dreamrec_text),
+    'dreamrec_fm_text':   ModelSpec(DreamRecFMTextConfig,    build_dreamrec_fm_text),
+    'dreamrec_alphafuse': ModelSpec(DreamRecAlphaFuseConfig, build_dreamrec_alphafuse),
 }
 
 

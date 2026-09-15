@@ -10,8 +10,11 @@
     config()                                          -> dict параметров, пишется в чекпойнт
 
 fit():
-    - сид, данные (шаффл train — через отдельный генератор), модель, AdamW + линейный warmup;
+    - сид, данные (шаффл train — через отдельный генератор), модель, Adam или AdamW
+      (optimizer.name) + линейный warmup;
     - обучение в bfloat16 autocast с gradient clipping;
+    - при optimizer.ema_decay — EMA обучаемых весов (класс EMA): валидация, best.pt и тест
+      идут по усреднённым весам, а метрики сырых весов пишутся в log_val.csv как raw_*;
     - каждые eval.every_epochs эпох: val loss, метрики, строка в log_val.csv,
       best.pt (по val NDCG@20) и latest.pt;
     - продолжение с latest.pt, если он есть;
@@ -22,8 +25,8 @@ fit():
 а поток случайности обучения — шаффл, шум, негативы — при этом не сбрасывается.
 
 Чекпойнты:
-    latest.pt — веса + состояние оптимизатора и scheduler (для продолжения обучения);
-    best.pt   — только веса, метрики и model_cfg.
+    latest.pt — сырые веса + состояние оптимизатора, scheduler и EMA (для продолжения обучения);
+    best.pt   — только веса (при EMA — усреднённые), метрики и model_cfg.
 """
 
 from __future__ import annotations
@@ -35,7 +38,7 @@ import argparse
 import csv
 import random
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Callable
 
@@ -49,6 +52,12 @@ from data import build_dataloaders
 from evaluate import evaluate
 
 EVAL_SEED = 42
+
+# weight_decay у них означает разное:
+#   adam  — L2: wd·θ прибавляется к градиенту и нормируется Adam вместе с ним. У редко
+#           обновляемых строк эмбеддингов √v мало, и затухание выходит порядка lr за шаг.
+#   adamw — развязанное затухание θ ← θ − lr·wd·θ, одинаковое для всех параметров.
+OPTIMIZERS = {'adam': torch.optim.Adam, 'adamw': torch.optim.AdamW}
 
 
 # --------------------------------------------------------------------------- #
@@ -78,6 +87,71 @@ def seeded(seed: int, device: torch.device):
     with torch.random.fork_rng(devices=devices):
         torch.manual_seed(seed)
         yield
+
+
+# --------------------------------------------------------------------------- #
+# EMA весов
+# --------------------------------------------------------------------------- #
+
+class EMA:
+    """
+    Экспоненциальное скользящее среднее обучаемых весов — теневые веса θ̄:
+
+        θ̄ ← β_t·θ̄ + (1 − β_t)·θ  после каждого шага оптимизатора,
+        β_t = min(decay, (1 + t) / (10 + t)).
+
+    Растущее β_t даёт короткое окно в начале, чтобы в θ̄ не застревала случайная инициализация;
+    дальше полураспад вклада старых весов — ln 2 / (1 − decay) шагов. Обучение идёт по θ,
+    оценка — по θ̄ внутри applied(). Усредняются только параметры с requires_grad:
+    замороженные эмбеддинги и буферы не меняются, их копировать незачем.
+    """
+
+    def __init__(self, model: nn.Module, decay: float):
+        if not 0.0 < decay < 1.0:
+            raise ValueError(f'ema_decay должен быть в (0, 1), получено {decay}')
+        self.decay  = decay
+        self.step   = 0
+        named       = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+        self.names  = [n for n, _ in named]
+        self.params = [p for _, p in named]
+        self.shadow = [p.detach().clone() for p in self.params]
+
+    @torch.no_grad()
+    def update(self) -> None:
+        self.step += 1
+        beta = min(self.decay, (1 + self.step) / (10 + self.step))
+        for s, p in zip(self.shadow, self.params):
+            s.lerp_(p.detach(), 1.0 - beta)
+
+    @contextmanager
+    def applied(self):
+        """На время блока параметры модели — теневые веса; после блока сырые веса возвращаются."""
+        self._swap()
+        try:
+            yield
+        finally:
+            self._swap()
+
+    def _swap(self) -> None:
+        # Обмен тензорами вместо копирования: без второй копии весов в памяти.
+        # Параметры остаются теми же объектами, так что состояние оптимизатора не затрагивается
+        for i, p in enumerate(self.params):
+            p.data, self.shadow[i] = self.shadow[i], p.data
+
+    def state_dict(self) -> dict:
+        return {'decay': self.decay, 'step': self.step, 'shadow': dict(zip(self.names, self.shadow))}
+
+    def load_state_dict(self, state: dict) -> None:
+        if set(state['shadow']) != set(self.names):
+            raise ValueError('EMA в чекпойнте не совпадает с обучаемыми параметрами модели')
+        self.step = state['step']
+        for s, name in zip(self.shadow, self.names):
+            s.copy_(state['shadow'][name])
+
+
+def _raw_keys(top_k: tuple[int, ...]) -> list[str]:
+    """Столбцы log_val.csv с val loss и метриками сырых весов (при EMA)."""
+    return ['raw_val_loss'] + [f'raw_{m}@{k}' for k in top_k for m in ('HR', 'NDCG')]
 
 
 # --------------------------------------------------------------------------- #
@@ -111,22 +185,29 @@ def save_checkpoint(
     model_cfg: dict,
     optimizer: torch.optim.Optimizer | None = None,
     scheduler=None,
+    ema: EMA | None = None,
 ) -> None:
-    """Без optimizer — только веса (best.pt); с ним — ещё и состояние для resume (latest.pt)."""
+    """
+    Без optimizer — только веса (best.pt); с ним — ещё и состояние для resume (latest.pt).
+    Сохраняются текущие параметры модели: внутри ema.applied() это усреднённые веса.
+    """
     state = {
         'epoch':       epoch,
         'step':        step,
         'model_state': model.state_dict(),
         'metrics':     metrics,
         'model_cfg':   model_cfg,
+        'ema_decay':   ema.decay if ema is not None else None,
     }
     if optimizer is not None:
         state['optimizer_state'] = optimizer.state_dict()
         state['scheduler_state'] = scheduler.state_dict()
+        if ema is not None:
+            state['ema_state'] = ema.state_dict()
     torch.save(state, path)
 
 
-def _resume(out_dir: Path, model: nn.Module, optimizer, scheduler,
+def _resume(out_dir: Path, model: nn.Module, optimizer, scheduler, ema: EMA | None,
             device: torch.device) -> tuple[int, int, float]:
     """Продолжение с latest.pt. Возвращает (эпоха, шаг, лучший val NDCG@20)."""
     latest = out_dir / 'latest.pt'
@@ -134,9 +215,25 @@ def _resume(out_dir: Path, model: nn.Module, optimizer, scheduler,
         return 0, 0, 0.0
 
     ckpt = torch.load(latest, map_location=device)
+    # load_state_dict перезаписал бы флаг decoupled_weight_decay из чекпойнта, и Adam
+    # молча работал бы как AdamW (или наоборот)
+    saved_group = ckpt['optimizer_state']['param_groups'][0]
+    current     = optimizer.param_groups[0].get('decoupled_weight_decay')
+    if saved_group.get('decoupled_weight_decay', current) != current:
+        raise ValueError(f'{latest}: оптимизатор в чекпойнте не совпадает с optimizer.name в конфиге; '
+                         f'смените output.run_name или верните прежний оптимизатор')
+    # best.pt и метрики прогона считались либо по сырым, либо по усреднённым весам — не смешиваем
+    if (ema is not None) != ('ema_state' in ckpt):
+        raise ValueError(f'{latest}: EMA {"есть" if "ema_state" in ckpt else "нет"} в чекпойнте, '
+                         f'а optimizer.ema_decay={ema.decay if ema is not None else None} в конфиге; '
+                         f'смените output.run_name или верните прежнюю настройку')
     model.load_state_dict(ckpt['model_state'])
     optimizer.load_state_dict(ckpt['optimizer_state'])
     scheduler.load_state_dict(ckpt['scheduler_state'])
+    if ema is not None:
+        if ckpt['ema_state']['decay'] != ema.decay:
+            print(f'EMA decay меняется с {ckpt["ema_state"]["decay"]} на {ema.decay}')
+        ema.load_state_dict(ckpt['ema_state'])
 
     # Лучшую метрику берём из best.pt — иначе первая же валидация перезапишет best.pt
     best = out_dir / 'best.pt'
@@ -216,12 +313,19 @@ def fit(
     print(f'{type(model).__name__}: trainable {sum(p.numel() for p in params):,}, frozen {n_frozen:,}')
     model_cfg = model.config()      # в чекпойнт, его читают ноутбуки анализа
 
-    optimizer = torch.optim.AdamW(params, lr=opt.lr, weight_decay=opt.weight_decay)
+    if opt.name not in OPTIMIZERS:
+        raise ValueError(f'optimizer.name должен быть одним из {list(OPTIMIZERS)}, получено {opt.name!r}')
+    optimizer = OPTIMIZERS[opt.name](params, lr=opt.lr, weight_decay=opt.weight_decay)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lr_lambda=_warmup(opt.warmup_epochs * steps_per_epoch),
     )
+    ema = EMA(model, opt.ema_decay) if opt.ema_decay is not None else None
+    if ema is not None:
+        print(f'EMA: decay {ema.decay}, полураспад {np.log(2) / (1 - ema.decay):.0f} шагов '
+              f'(≈{np.log(2) / (1 - ema.decay) / steps_per_epoch:.1f} эпох)')
+    ema_weights = ema.applied if ema is not None else nullcontext
 
-    start_epoch, step, best_ndcg20 = _resume(out_dir, model, optimizer, scheduler, device)
+    start_epoch, step, best_ndcg20 = _resume(out_dir, model, optimizer, scheduler, ema, device)
     if start_epoch >= opt.num_epochs:
         print(f'Обучение уже завершено ({start_epoch}/{opt.num_epochs} эпох) — только финальный тест')
 
@@ -229,6 +333,12 @@ def fit(
     grad_clip    = opt.grad_clip if opt.grad_clip is not None else float('inf')
     sample_steps = cfg.eval.num_sample_steps or 1       # SASRec не сэмплирует
     w_cfg        = getattr(cfg.model, 'w_cfg', 0.0)
+
+    def run_val_loss() -> float:
+        # Засеян, как и сэмплинг: не расходует поток случайности обучения, поэтому траектория
+        # не зависит от того, сколько раз считается val loss (с EMA — дважды)
+        with seeded(EVAL_SEED, device):
+            return _mean_loss(model, val_loader, device, use_amp)
 
     def run_eval(loader) -> dict[str, float]:
         with seeded(EVAL_SEED, device):
@@ -252,6 +362,8 @@ def fit(
             nn.utils.clip_grad_norm_(params, max_norm=grad_clip)
             optimizer.step()
             scheduler.step()
+            if ema is not None:
+                ema.update()
             step += 1
             epoch_loss += loss.item()
 
@@ -268,21 +380,28 @@ def fit(
         # ── Валидация ──────────────────────────────────────────────────
         print(f'\n--- Eval after epoch {epoch + 1} ---')
         model.eval()
-        val_loss = _mean_loss(model, val_loader, device, use_amp)
-        metrics  = run_eval(val_loader)
+        raw = {}
+        if ema is not None:
+            # Сырые веса — для контроля выигрыша/отставания EMA; сиды сэмплинга те же, сравнение парное
+            raw_loss, raw_metrics = run_val_loss(), run_eval(val_loader)
+            raw = dict(zip(_raw_keys(cfg.eval.top_k), [round(raw_loss, 6), *raw_metrics.values()]))
+            print(f'Raw weights: val loss {raw_loss:.4f} | {raw_metrics}')
+
+        ckpt = dict(model=model, epoch=epoch + 1, step=step, model_cfg=model_cfg, ema=ema)
+        with ema_weights():
+            val_loss = run_val_loss()
+            metrics  = run_eval(val_loader)
+            if metrics['NDCG@20'] > best_ndcg20:
+                best_ndcg20 = metrics['NDCG@20']
+                save_checkpoint(out_dir / 'best.pt', metrics=metrics, **ckpt)
+                print(f'New best NDCG@20: {best_ndcg20:.4f} — saved best.pt')
         model.train()
 
-        print(f'Val loss: {val_loss:.4f} | {metrics}')
+        print(f'Val loss: {val_loss:.4f} | {metrics}' + (' (EMA)' if ema is not None else ''))
         val_logger.log({'epoch': epoch + 1, 'step': step, 'val_loss': round(val_loss, 6),
-                        **metrics})
-
-        ckpt = dict(model=model, epoch=epoch + 1, step=step, metrics=metrics,
-                    model_cfg=model_cfg)
-        if metrics['NDCG@20'] > best_ndcg20:
-            best_ndcg20 = metrics['NDCG@20']
-            save_checkpoint(out_dir / 'best.pt', **ckpt)
-            print(f'New best NDCG@20: {best_ndcg20:.4f} — saved best.pt')
-        save_checkpoint(out_dir / 'latest.pt', **ckpt, optimizer=optimizer, scheduler=scheduler)
+                        **metrics, **raw})
+        save_checkpoint(out_dir / 'latest.pt', metrics=metrics, **ckpt,
+                        optimizer=optimizer, scheduler=scheduler)
         print()
 
     # ------------------------------------------------------------------ #
@@ -296,8 +415,9 @@ def fit(
     test_metrics = run_eval(loaders['test'])
 
     print(f'Test: {test_metrics}')
-    # Пустой val_loss: строка test совпадает по столбцам с заголовком
-    val_logger.log({'epoch': 'test', 'step': step, 'val_loss': '', **test_metrics})
+    # Пустые val_loss и raw_*: строка test совпадает по столбцам с заголовком
+    raw_empty = dict.fromkeys(_raw_keys(cfg.eval.top_k), '') if ema is not None else {}
+    val_logger.log({'epoch': 'test', 'step': step, 'val_loss': '', **test_metrics, **raw_empty})
     print('\nDone.')
     return test_metrics
 

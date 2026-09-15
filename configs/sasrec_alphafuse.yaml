@@ -1,0 +1,44 @@
+seed: 42
+model_type: sasrec_alphafuse
+
+data:
+  data_dir: ./data/ATG
+  emb_path: ./data/ATG/3large_emb.pickle
+  whitening_cache: ./data/processed/whitening_cache.npz
+  padding_idx: 11924
+  n_items: 11924
+  batch_size: 256
+  num_workers: 4
+  max_seq_len: 10
+
+model:
+  d_model: 128          # топ-128 отбеленных компонент TEM (d_s + d_n в статье)
+  null_dim: 64         # ID в последних 64 из них (компоненты 65–128)
+  null_thres: null
+  fusion: add           # add — как в статье для SASRec (Eq. 10); replace — null-координаты семантики заменяются ID
+  id_init: normal       # ATG в README AlphaFuse; для Movies там zeros
+  n_heads: 1
+  n_layers: 1
+  d_ff: 128
+  dropout: 0.1
+  loss: infonce
+  neg_ratio: 64
+  temperature: 0.07
+  retrieval_metric: dot  # cosine, dot (dot — как в AlphaFuse)
+
+optimizer:
+  name: adam           # adam — weight_decay как L2 в градиенте (как в AlphaFuse); adamw — развязанный decay
+  lr: 1e-2
+  weight_decay: 1e-6
+  grad_clip: 1.0
+  num_epochs: 500
+  warmup_epochs: 1
+  ema_decay: null       # null — без EMA; 0.999 — полураспад ≈ 690 шагов (≈12 эпох)
+
+eval:
+  every_epochs: 10
+  top_k: [10, 20]
+
+output:
+  dir: ./checkpoints
+  run_name: sasrec_alphafuse

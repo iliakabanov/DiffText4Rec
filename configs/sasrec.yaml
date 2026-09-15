@@ -19,13 +19,16 @@ model:
   loss: infonce
   neg_ratio: 64
   temperature: 0.07
+  retrieval_metric: dot   # cosine, dot
 
 optimizer:
+  name: adam           # adam — weight_decay как L2 в градиенте; adamw — развязанный decay
   lr: 1e-3
   weight_decay: 1e-6
   grad_clip: 1.0
   num_epochs: 100
   warmup_epochs: 1
+  ema_decay: null       # null — без EMA; 0.999 — полураспад ≈ 690 шагов (≈12 эпох)
 
 eval:
   every_epochs: 10

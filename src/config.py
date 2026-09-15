@@ -44,11 +44,13 @@ class TextDataConfig(DataConfig):
 
 @dataclass
 class OptimizerConfig:
+    name:          str              # adam — weight_decay как L2 в градиенте; adamw — развязанный decay
     lr:            float
     weight_decay:  float
     grad_clip:     float | None     # null — без клиппинга
     num_epochs:    int
     warmup_epochs: int
+    ema_decay:     float | None     # null — без EMA; иначе оценка и best.pt по усреднённым весам
 
 
 @dataclass

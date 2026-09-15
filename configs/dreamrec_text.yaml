@@ -25,11 +25,13 @@ model:
   retrieval_metric: cosine   # l2, dot, cosine
 
 optimizer:
+  name: adamw           # adam — weight_decay как L2 в градиенте; adamw — развязанный decay
   lr: 1e-4
   weight_decay: 0.0
   grad_clip: 1.0
   num_epochs: 250
   warmup_epochs: 0
+  ema_decay: null       # null — без EMA; иначе оценка и best.pt по усреднённым весам
 
 eval:
   every_epochs: 10

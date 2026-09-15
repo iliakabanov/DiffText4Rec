@@ -2,6 +2,7 @@
 Строительные блоки генеративных рекомендеров (см. models/dreamrec.py).
 
     ItemEmbedding   — эмбеддинги товаров: обучаемые с нуля или замороженные текстовые.
+    AlphaFuseItemEmbedding — замороженные текстовые + обучаемые ID в их null-координатах.
     HistoryEncoder  — история взаимодействий → conditioning-вектор h (один SASRec-блок).
     ConcatDenoiser  — сеть concat([x, h, t_emb]) → Linear(3d, d) с токеном «без условия» для CFG.
 
@@ -115,6 +116,96 @@ class ItemEmbedding(nn.Module):
     def table(self) -> torch.Tensor:
         """(N_items, d_emb) — эмбеддинги всех товаров без padding (для ретривала)."""
         return self.embedding.weight[:self.n_items]
+
+
+ALPHAFUSE_FUSIONS = ('add', 'replace')
+ALPHAFUSE_ID_INITS = ('normal', 'zeros')
+
+
+class AlphaFuseItemEmbedding(nn.Module):
+    """
+    Эмбеддинги товаров AlphaFuse (Hu et al., 2025): ID-эмбеддинги учатся в «нуль-пространстве»
+    текстовых эмбеддингов. Интерфейс как у ItemEmbedding: forward(idx), table, n_items, d_emb, info.
+
+    Семантика — замороженные текстовые эмбеддинги после PCA до d_emb и whitening по компонентам
+    (Var = I). Компоненты упорядочены по убыванию дисперсии, последние nullity из них — null-часть.
+    Обучаемый ID-вектор (nullity) вливается в неё:
+
+        fusion='add'      e = [s_1..s_{d−k},  s_{d−k+1..d} + id]    — Eq. 10 статьи, SASRec; дефолт кода (cover=False)
+        fusion='replace'  e = [s_1..s_{d−k},  id]                   — статья для DreamRec (разд. 4.1.5): null-координаты
+                                                                      семантики отброшены, Var(e) = I сохраняется
+
+    nullity задаётся ровно одним из:
+        null_dim   — числом;
+        null_thres — порогом на собственные значения ковариации сырых эмбеддингов (λ ≤ null_thres)
+                     среди d_emb оставленных компонент. Порог AlphaFuse 0.25 считается для
+                     эмбеддингов ×40, у нас ему соответствует 0.25 / 40² = 1.5625e-4.
+    """
+
+    def __init__(
+        self,
+        emb_raw: np.ndarray,
+        padding_idx: int,
+        d_emb: int,
+        null_dim: int | None,
+        null_thres: float | None,
+        fusion: str,
+        id_init: str,
+        whitening_cache: str | Path,
+    ):
+        super().__init__()
+        n_items = emb_raw.shape[0]
+        if padding_idx != n_items:
+            raise ValueError(f'padding_idx={padding_idx} должен быть последней строкой ({n_items})')
+        if (null_dim is None) == (null_thres is None):
+            raise ValueError('задайте ровно одно из null_dim и null_thres')
+        if fusion not in ALPHAFUSE_FUSIONS:
+            raise ValueError(f'fusion должен быть одним из {ALPHAFUSE_FUSIONS}, получено {fusion!r}')
+        if id_init not in ALPHAFUSE_ID_INITS:
+            raise ValueError(f'id_init должен быть одним из {ALPHAFUSE_ID_INITS}, получено {id_init!r}')
+
+        mu, V, scale = load_or_compute_whitening(emb_raw, d_emb, whitening_cache, per_component=True)
+        eigvals = scale ** 2                    # std компоненты² = собственное значение ковариации
+        nullity = null_dim if null_dim is not None else int((eigvals <= null_thres).sum())
+        if not 0 < nullity < d_emb:
+            raise ValueError(f'nullity={nullity} должен быть в (0, d_emb={d_emb})')
+
+        semantic = apply_whitening(emb_raw.astype(np.float32), mu, V, scale)
+        if fusion == 'replace':
+            semantic = semantic[:, :d_emb - nullity]
+        semantic = np.vstack([semantic, np.zeros((1, semantic.shape[1]), dtype=np.float32)])
+
+        self.n_items = n_items
+        self.d_emb   = d_emb
+        self.nullity = nullity
+        self.fusion  = fusion
+        self.info    = {'item_embedding': 'alphafuse', 'fusion': fusion, 'nullity': nullity,
+                        'null_dim': null_dim, 'null_thres': null_thres, 'id_init': id_init}
+
+        self.semantic = nn.Embedding.from_pretrained(torch.from_numpy(semantic), freeze=True,
+                                                     padding_idx=padding_idx)
+        self.id_embedding = nn.Embedding(n_items + 1, nullity, padding_idx=padding_idx)
+        if id_init == 'normal':
+            nn.init.normal_(self.id_embedding.weight, 0.0, 1.0)
+        else:
+            nn.init.zeros_(self.id_embedding.weight)
+        with torch.no_grad():
+            self.id_embedding.weight[padding_idx].zero_()
+
+    def _fuse(self, semantic: torch.Tensor, id_emb: torch.Tensor) -> torch.Tensor:
+        if self.fusion == 'replace':
+            return torch.cat([semantic, id_emb], dim=-1)
+        k = self.nullity
+        return torch.cat([semantic[..., :-k], semantic[..., -k:] + id_emb], dim=-1)
+
+    def forward(self, idx: torch.LongTensor) -> torch.Tensor:
+        return self._fuse(self.semantic(idx), self.id_embedding(idx))
+
+    @property
+    def table(self) -> torch.Tensor:
+        """(N_items, d_emb) — слитые эмбеддинги всех товаров без padding (для ретривала)."""
+        n = self.n_items
+        return self._fuse(self.semantic.weight[:n], self.id_embedding.weight[:n])
 
 
 # --------------------------------------------------------------------------- #

@@ -8,6 +8,9 @@ SASRec: Self-Attentive Sequential Recommendation (Kang & McAuley, 2018).
     → h[:, -1, :]  (последняя позиция = последний реальный айтем при left-padding)
     → logits = h @ item_emb.weight[:n_items].T  (tied weights)
 
+SASRecAlphaFuse — тот же SASRec на эмбеддингах AlphaFuse (замороженная текстовая семантика
++ обучаемые ID в её null-координатах, см. models.components.AlphaFuseItemEmbedding).
+
 Интерфейс общий с DreamRec-моделями и evaluate():
     compute_loss(history, target, mask)  → scalar
     recommend(history, mask, top_k, ...) → (B, top_k) LongTensor
@@ -18,6 +21,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+SASREC_RETRIEVAL_METRICS = ('cosine', 'dot')
 
 
 # --------------------------------------------------------------------------- #
@@ -92,6 +97,12 @@ class SASRec(nn.Module):
                      'infonce' — контрастивный InfoNCE с neg_ratio негативами.
         neg_ratio:   число случайных негативов на один позитив (только для 'infonce').
         temperature: температура InfoNCE (только для 'infonce').
+        retrieval_metric: ранжирование в recommend(): 'cosine' — косинус h и эмбеддингов товаров;
+                     'dot' — логиты (h · эмбеддинги при tie_weights, иначе output_proj), здесь на
+                     порядок влияют и нормы эмбеддингов товаров.
+        items:      внешний модуль эмбеддингов товаров с интерфейсом ItemEmbedding
+                     (forward(idx), table, d_emb, info) вместо собственной обучаемой таблицы;
+                     требует tie_weights=True. None — своя таблица item_embedding.
     """
 
     def __init__(
@@ -108,8 +119,18 @@ class SASRec(nn.Module):
         loss: str = 'infonce',
         neg_ratio: int = 64,
         temperature: float = 0.07,
+        retrieval_metric: str = 'cosine',
+        items: nn.Module | None = None,
     ):
         super().__init__()
+        if retrieval_metric not in SASREC_RETRIEVAL_METRICS:
+            raise ValueError(f'retrieval_metric должен быть одним из {SASREC_RETRIEVAL_METRICS}, '
+                             f'получено {retrieval_metric!r}')
+        if items is not None:
+            if not tie_weights:
+                raise ValueError('внешние эмбеддинги товаров (items) требуют tie_weights=True')
+            if items.d_emb != d_model:
+                raise ValueError(f'items.d_emb={items.d_emb} не совпадает с d_model={d_model}')
 
         self.n_items     = n_items
         self.padding_idx = padding_idx
@@ -120,12 +141,15 @@ class SASRec(nn.Module):
         self.loss        = loss
         self.neg_ratio   = neg_ratio
         self.temperature = temperature
+        self.retrieval_metric = retrieval_metric
 
-        # Learnable item embeddings.
+        # Эмбеддинги товаров: внешний модуль или своя обучаемая таблица.
         # padding_idx обнуляет вектор и запрещает градиент через него.
-        self.item_embedding = nn.Embedding(
-            n_items + 1, d_model, padding_idx=padding_idx
-        )
+        self.items = items
+        if items is None:
+            self.item_embedding = nn.Embedding(
+                n_items + 1, d_model, padding_idx=padding_idx
+            )
         # Learnable absolute positional embeddings (0..max_seq_len-1).
         self.pos_embedding = nn.Embedding(max_seq_len, d_model)
         self.dropout_emb   = nn.Dropout(dropout)
@@ -147,11 +171,12 @@ class SASRec(nn.Module):
     # ------------------------------------------------------------------ #
 
     def _init_weights(self) -> None:
-        nn.init.normal_(self.item_embedding.weight, mean=0.0, std=0.02)
-        # Явно обнуляем padding-вектор (nn.Embedding с padding_idx делает это,
-        # но после normal_init нужно обнулить вручную).
-        with torch.no_grad():
-            self.item_embedding.weight[self.padding_idx].zero_()
+        if self.items is None:
+            nn.init.normal_(self.item_embedding.weight, mean=0.0, std=0.02)
+            # Явно обнуляем padding-вектор (nn.Embedding с padding_idx делает это,
+            # но после normal_init нужно обнулить вручную).
+            with torch.no_grad():
+                self.item_embedding.weight[self.padding_idx].zero_()
         nn.init.zeros_(self.pos_embedding.weight)
         for block in self.blocks:
             nn.init.xavier_uniform_(block.attn.in_proj_weight)
@@ -186,7 +211,7 @@ class SASRec(nn.Module):
         device = history.device
 
         # Embeddings
-        x = self.item_embedding(history)                                # (B, L, d_model)
+        x = self._embed(history)                                        # (B, L, d_model)
         positions = torch.arange(L, device=device).unsqueeze(0)         # (1, L)
         x = x + self.pos_embedding(positions)                           # (B, L, d_model)
         x = self.dropout_emb(x)
@@ -249,7 +274,6 @@ class SASRec(nn.Module):
         """
         B      = h.shape[0]
         device = h.device
-        W      = self.item_embedding.weight[:self.n_items]               # (N, d_model)
 
         # Случайные негативы: (B, neg_ratio), исключаем совпадения с позитивом
         neg = torch.randint(0, self.n_items, (B, self.neg_ratio), device=device)
@@ -260,8 +284,8 @@ class SASRec(nn.Module):
             neg = torch.where(collision, replacement, neg)
 
         # Эмбеддинги позитива и негативов
-        e_pos = W[target]                                                # (B, d_model)
-        e_neg = W[neg]                                                   # (B, neg_ratio, d_model)
+        e_pos = self._embed(target)                                      # (B, d_model)
+        e_neg = self._embed(neg)                                         # (B, neg_ratio, d_model)
 
         # L2-нормировка
         h     = F.normalize(h,     dim=-1)                              # (B, d_model)
@@ -301,9 +325,8 @@ class SASRec(nn.Module):
             (B, top_k) LongTensor — индексы товаров
         """
         h = self.forward(history, mask)                                  # (B, d_model)
-        if self.loss == 'infonce':
-            # При InfoNCE обучении пространство нормировано — используем косинус
-            W = self.item_embedding.weight[:self.n_items]
+        if self.retrieval_metric == 'cosine':
+            W = self._item_table()
             scores = F.normalize(h, dim=-1) @ F.normalize(W, dim=-1).T
         else:
             scores = self._logits(h)                                     # (B, n_items)
@@ -313,11 +336,19 @@ class SASRec(nn.Module):
     # Helpers
     # ------------------------------------------------------------------ #
 
+    def _embed(self, idx: torch.LongTensor) -> torch.Tensor:
+        """Индексы товаров (любой формы) → эмбеддинги (..., d_model)."""
+        return self.item_embedding(idx) if self.items is None else self.items(idx)
+
+    def _item_table(self) -> torch.Tensor:
+        """(n_items, d_model) — эмбеддинги всех товаров без padding."""
+        return self.item_embedding.weight[:self.n_items] if self.items is None else self.items.table
+
     def _logits(self, h: torch.Tensor) -> torch.Tensor:
         """(B, d_model) → (B, n_items) logits."""
         if self.tie_weights:
-            # Tied weights: используем item_embedding (строки 0..n_items-1)
-            return h @ self.item_embedding.weight[:self.n_items].T
+            # Tied weights: используем эмбеддинги товаров (строки 0..n_items-1)
+            return h @ self._item_table().T
         else:
             return self.output_proj(h)
 
@@ -334,11 +365,38 @@ class SASRec(nn.Module):
             'loss': self.loss,
             'neg_ratio': self.neg_ratio,
             'temperature': self.temperature,
+            'retrieval_metric': self.retrieval_metric,
+            **(self.items.info if self.items is not None else {}),
         }
 
     def param_summary(self) -> dict:
-        total = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        return {'total_trainable': total, 'total_frozen': 0}
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        frozen    = sum(p.numel() for p in self.parameters() if not p.requires_grad)
+        return {'total_trainable': trainable, 'total_frozen': frozen}
+
+
+class SASRecAlphaFuse(SASRec):
+    """
+    SASRec на эмбеддингах AlphaFuse (models.components.AlphaFuseItemEmbedding): замороженная
+    отбеленная семантика + обучаемые ID в её null-координатах; выход привязан к ним же.
+    """
+
+    def __init__(self, *, item_embeddings_raw, padding_idx: int, d_model: int,
+                 null_dim: int | None, null_thres: float | None, fusion: str, id_init: str,
+                 whitening_cache, n_heads: int, n_layers: int, d_ff: int, dropout: float,
+                 max_seq_len: int, loss: str, neg_ratio: int, temperature: float,
+                 retrieval_metric: str):
+        # Импорт здесь: models.components сам импортирует SASRecBlock из этого модуля
+        from models.components import AlphaFuseItemEmbedding
+
+        items = AlphaFuseItemEmbedding(item_embeddings_raw, padding_idx, d_model, null_dim,
+                                       null_thres, fusion, id_init, whitening_cache)
+        super().__init__(
+            n_items=items.n_items, padding_idx=padding_idx, d_model=d_model, n_heads=n_heads,
+            n_layers=n_layers, d_ff=d_ff, dropout=dropout, max_seq_len=max_seq_len,
+            tie_weights=True, loss=loss, neg_ratio=neg_ratio, temperature=temperature,
+            retrieval_metric=retrieval_metric, items=items,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -417,5 +475,38 @@ if __name__ == '__main__':
         h_short = model.forward(history, mask)
     assert not torch.allclose(h_full, h_short), 'Full vs short sequences should differ'
     print(f'Full vs short sequences differ  OK')
+
+    # Test 7: SASRecAlphaFuse — градиент только в ID, семантика заморожена, оба режима слияния
+    import tempfile
+    from pathlib import Path
+    import numpy as np
+
+    D, K = 32, 8
+    emb_raw = np.random.default_rng(0).standard_normal((N_ITEMS, 64)).astype(np.float32)
+    with tempfile.TemporaryDirectory() as tmp:
+        for fusion in ('add', 'replace'):
+            af = SASRecAlphaFuse(
+                item_embeddings_raw=emb_raw, padding_idx=PADDING_IDX, d_model=D, null_dim=K,
+                null_thres=None, fusion=fusion, id_init='normal', whitening_cache=Path(tmp) / 'wh.npz',
+                n_heads=1, n_layers=1, d_ff=D, dropout=0.1, max_seq_len=L, loss='infonce',
+                neg_ratio=16, temperature=0.07, retrieval_metric='cosine',
+            ).to(device).train()
+            af.compute_loss(history, target, mask).backward()
+            id_grad = af.items.id_embedding.weight.grad
+            assert af.items.semantic.weight.grad is None, 'Semantic part must be frozen'
+            assert id_grad is not None and id_grad[PADDING_IDX].abs().max().item() == 0.0
+            with torch.no_grad():
+                sem = af.items.semantic.weight[:N_ITEMS, :D - K]
+                assert torch.equal(af.items.table[:, :D - K], sem), 'Non-null part must equal semantic'
+            af.eval()
+            for metric in SASREC_RETRIEVAL_METRICS:
+                af.retrieval_metric = metric
+                recs = af.recommend(history, mask, top_k=20)
+                assert recs.shape == (B, 20) and (recs != PADDING_IDX).all()
+            # dot ранжирует по h · e: совпадает с логитами, а при разных нормах e отличается от cosine
+            with torch.no_grad():
+                h_af = af(history, mask)
+                assert torch.equal(recs, (h_af @ af.items.table.T).topk(20, dim=-1).indices)
+            print(f'SASRecAlphaFuse fusion={fusion}: {af.param_summary()} | {af.items.info}  OK')
 
     print('\nAll checks passed')

@@ -10,11 +10,12 @@ conditioning h → генеративный процесс восстанавл�
     denoiser  — сеть f(x, h, τ) + CFG        ConcatDenoiser
     process   — зашумление, loss, сэмплинг   DDPM | FlowMatching
 
-Три модели различаются только частями:
+Модели различаются только частями:
 
-    DreamRec        обучаемые ID-эмбеддинги        + DDPM
-    DreamRecText    замороженные текстовые (TEM)   + DDPM
-    DreamRecFMText  замороженные текстовые (TEM)   + Flow Matching
+    DreamRec           обучаемые ID-эмбеддинги                  + DDPM
+    DreamRecText       замороженные текстовые (TEM)             + DDPM
+    DreamRecFMText     замороженные текстовые (TEM)             + Flow Matching
+    DreamRecAlphaFuse  TEM + ID в null-координатах (AlphaFuse)  + DDPM
 
 Совместимы с evaluate() через recommend(history, mask, top_k, num_steps, w_cfg).
 """
@@ -28,7 +29,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.components import ConcatDenoiser, HistoryEncoder, ItemEmbedding
+from models.components import AlphaFuseItemEmbedding, ConcatDenoiser, HistoryEncoder, ItemEmbedding
 from models.processes import DDPM, FlowMatching
 
 RETRIEVAL_METRICS = ('cosine', 'dot', 'l2')
@@ -181,6 +182,24 @@ class DreamRecFMText(GenerativeRecommender):
         )
 
 
+class DreamRecAlphaFuse(GenerativeRecommender):
+    """DreamRec на эмбеддингах AlphaFuse: семантика TEM заморожена, ID учатся в её null-координатах; DDPM."""
+
+    def __init__(self, *, item_embeddings_raw: np.ndarray, padding_idx: int, d_emb: int,
+                 null_dim: int | None, null_thres: float | None, fusion: str, id_init: str,
+                 whitening_cache: str | Path, n_heads: int, d_ff: int, dropout: float,
+                 max_seq_len: int, T: int, beta_schedule: str, p_uncond: float, w_cfg: float,
+                 retrieval_metric: str):
+        super().__init__(
+            items=AlphaFuseItemEmbedding(item_embeddings_raw, padding_idx, d_emb, null_dim,
+                                         null_thres, fusion, id_init, whitening_cache),
+            encoder=HistoryEncoder(d_emb, n_heads, d_ff, dropout, max_seq_len),
+            denoiser=ConcatDenoiser(d_emb),
+            process=DDPM(T, beta_schedule),
+            p_uncond=p_uncond, w_cfg=w_cfg, retrieval_metric=retrieval_metric,
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Quick sanity check:  cd src && python -m models.dreamrec
 # --------------------------------------------------------------------------- #
@@ -220,6 +239,10 @@ if __name__ == '__main__':
             'DreamRecFMText': DreamRecFMText(item_embeddings_raw=emb_raw, use_pca=True, n_components=D,
                                              per_component_whitening=False,
                                              whitening_cache=Path(tmp) / 'wh.npz', **common),
+            **{f'DreamRecAlphaFuse ({fusion})': DreamRecAlphaFuse(
+                item_embeddings_raw=emb_raw, d_emb=D, null_dim=6, null_thres=None, fusion=fusion,
+                id_init='zeros', whitening_cache=Path(tmp) / 'wh.npz', T=50, beta_schedule='linear',
+                **common) for fusion in ('add', 'replace')},
         }
         history = torch.full((B, L), N_ITEMS, dtype=torch.long, device=device)
         history[:, 5:] = torch.randint(0, N_ITEMS, (B, 5), device=device)
@@ -231,11 +254,19 @@ if __name__ == '__main__':
             loss = model.compute_loss(history, target, mask)
             loss.backward()
             assert not torch.isnan(loss)
-            grad_items = model.items.embedding.weight.grad
-            if name == 'DreamRec':
+            if name.startswith('DreamRecAlphaFuse'):
+                grad_items = model.items.id_embedding.weight.grad
+                assert model.items.semantic.weight.grad is None
                 assert grad_items is not None and grad_items[N_ITEMS].abs().max() == 0.0
+                k = model.items.nullity
+                with torch.no_grad():
+                    assert torch.equal(model.items.table[:, :D - k], model.items.semantic.weight[:N_ITEMS, :D - k])
             else:
-                assert grad_items is None
+                grad_items = model.items.embedding.weight.grad
+                if name == 'DreamRec':
+                    assert grad_items is not None and grad_items[N_ITEMS].abs().max() == 0.0
+                else:
+                    assert grad_items is None
             assert model.encoder.block.parameters().__next__().grad is not None
             model.eval()
             for metric in RETRIEVAL_METRICS:
