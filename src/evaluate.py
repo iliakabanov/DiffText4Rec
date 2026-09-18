@@ -8,16 +8,17 @@ Full-rank protocol — стандарт в современных работах
 (AlphaFuse, iDreamRec, SASRec). Sampled protocol даёт завышенные
 и несопоставимые числа.
 
-Оценка чекпойнта из командной строки (из корня проекта — пути в yaml относительные):
+Оценка прогонов из командной строки (из корня проекта — пути в yaml относительные):
 
-    python src/evaluate.py --config configs/dreamrec.yaml --checkpoint checkpoints/dreamrec_1/best.pt
-    python src/evaluate.py --config ... --checkpoint ... --seeds 10 --splits test
+    python src/evaluate.py --config configs/dreamrec.yaml --n-runs 5
+    python src/evaluate.py --config ... --n-runs 3 --seeds 10 --splits test
     python src/evaluate.py --self-test
 
-Метрики считаются по протоколу тренера (batch_size, шаги сэмплинга и w_cfg — из конфига)
-для сидов сэмплинга 42, 142, 242, ...; сид 42 воспроизводит val/test из лога обучения.
-Печатается таблица mean ± std: строки — способ ретривала (dot / cosine / L2) и случайный
-бейзлайн, столбцы — метрики. Все ретривалы считаются по одному и тому же oracle-эмбеддингу.
+Берутся best.pt прогонов <имя конфига>_1 … <имя конфига>_N из output.dir (так их называет
+scripts/run_seeds.py). Каждый чекпойнт оценивается по протоколу тренера (batch_size, шаги
+сэмплинга и w_cfg — из конфига) для сидов сэмплинга 1, 2, 3, ... Печатается таблица mean ± std по всем N × seeds запускам: строки —
+способ ретривала (dot / cosine / L2) и случайный бейзлайн, столбцы — метрики. Все ретривалы
+считаются по одному и тому же oracle-эмбеддингу.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
 
 import argparse
 import math
+from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
@@ -229,65 +231,79 @@ def evaluate_retrievals(
 
 
 # --------------------------------------------------------------------------- #
-# Оценка чекпойнта
+# Оценка прогонов
 # --------------------------------------------------------------------------- #
 
-def evaluate_checkpoint(
+def evaluate_runs(
     config_path: str,
-    checkpoint_path: str,
+    n_runs: int,
     n_seeds: int = 5,
     splits: tuple[str, ...] = ('val', 'test'),
 ) -> dict:
     """
-    Метрики чекпойнта по протоколу тренера для n_seeds сидов сэмплинга.
+    Метрики best.pt прогонов <имя конфига>_1 … <имя конфига>_{n_runs} из output.dir по протоколу
+    тренера, у каждого — n_seeds сидов сэмплинга.
 
-    Модель собирается по тому же конфигу, что и при обучении (builders.MODELS[model_type]).
+    Имена прогонов — как у scripts/run_seeds.py: run_name = <имя yaml без расширения>_<i>.
+    Модель собирается один раз по конфигу (builders.MODELS[model_type]), веса чекпойнтов грузятся
+    в неё по очереди — архитектура в yaml должна совпадать со всеми прогонами.
 
     Returns:
-        {'model', 'epoch', 'saved_metrics', 'seeds', 'retrieval_row',
-         'results': {split: {строка таблицы: {метрика: [по сидам]}}}}
+        {'model', 'runs': [{'name', 'epoch', 'saved_metrics'}], 'seeds', 'retrieval_row',
+         'results': {split: {строка таблицы: {метрика: [n_runs × n_seeds значений, прогон за прогоном]}}}}
     """
     # Импорт здесь, а не наверху: train сам импортирует evaluate
     from builders import load_model_config
     from data import build_dataloaders
-    from train import EVAL_SEED, seeded
+    from train import seeded
+
+    spec, cfg = load_model_config(config_path)
+    prefix = Path(config_path).stem
+    paths  = [Path(cfg.output.dir) / f'{prefix}_{i}' / 'best.pt' for i in range(1, n_runs + 1)]
+    missing = [str(p) for p in paths if not p.exists()]
+    if missing:
+        raise FileNotFoundError(f'нет чекпойнтов: {missing}')
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    ckpt = torch.load(checkpoint_path, map_location='cpu', mmap=True)
-    spec, cfg = load_model_config(config_path)
-
-    model = spec.build(cfg)
-    model.load_state_dict(ckpt['model_state'])      # строго: архитектура в yaml должна совпадать
-    model = model.to(device).eval()
-
-    saved_cfg = ckpt.get('model_cfg') or {}
-    if saved_cfg:                                   # у старых чекпойнтов SASRec он пустой
-        diff = {k: (saved_cfg.get(k), v) for k, v in model.config().items() if saved_cfg.get(k) != v}
-        if diff:
-            print(f'Конфиг отличается от чекпойнта (в чекпойнте → в конфиге): {diff}')
-
+    model  = spec.build(cfg).to(device)
     loaders = build_dataloaders(cfg.data.data_dir, batch_size=cfg.data.batch_size, num_workers=0,
                                 seq_len=cfg.data.max_seq_len, splits=splits)
-    seeds = [EVAL_SEED + 100 * i for i in range(n_seeds)]
-    results = {}
-    for split in splits:
-        runs = []
-        for seed in seeds:
-            with seeded(seed, device):
-                runs.append(evaluate_retrievals(model, loaders[split], top_k_values=cfg.eval.top_k,
-                                                num_sample_steps=cfg.eval.num_sample_steps or 1,
-                                                w_cfg=getattr(cfg.model, 'w_cfg', 0.0),
-                                                device=device, show_progress=False))
-        results[split] = {row: {metric: [run[row][metric] for run in runs] for metric in runs[0][row]}
-                          for row in runs[0]}
+    seeds = list(range(1, n_seeds + 1))
+
+    runs = []
+    results: dict[str, dict[str, dict[str, list[float]]]] = {split: {} for split in splits}
+    for path in paths:
+        name = path.parent.name
+        ckpt = torch.load(path, map_location='cpu', mmap=True)
+        model.load_state_dict(ckpt['model_state'])  # строго: архитектура в yaml должна совпадать
+        model.eval()
+
+        saved_cfg = ckpt.get('model_cfg') or {}
+        if saved_cfg:                               # у старых чекпойнтов SASRec он пустой
+            diff = {k: (saved_cfg.get(k), v) for k, v in model.config().items() if saved_cfg.get(k) != v}
+            if diff:
+                print(f'{name}: конфиг отличается от чекпойнта (в чекпойнте → в конфиге): {diff}')
+        runs.append({'name': name, 'epoch': ckpt.get('epoch'), 'saved_metrics': ckpt.get('metrics')})
+        del ckpt
+
+        for split in splits:
+            for seed in seeds:
+                with seeded(seed, device):
+                    run = evaluate_retrievals(model, loaders[split], top_k_values=cfg.eval.top_k,
+                                              num_sample_steps=cfg.eval.num_sample_steps or 1,
+                                              w_cfg=getattr(cfg.model, 'w_cfg', 0.0),
+                                              device=device, show_progress=False)
+                for row, metrics in run.items():
+                    for metric, value in metrics.items():
+                        results[split].setdefault(row, {}).setdefault(metric, []).append(value)
+        print(f'{name} (эпоха {runs[-1]["epoch"]}): готово', flush=True)
 
     # Строка таблицы, соответствующая ретривалу из конфига (с ним считались метрики при обучении);
     # у SASRec строка одна — ранжирует сама модель по своему retrieval_metric
     by_metric = {metric: row for row, metric in RETRIEVAL_ROWS.items()}
     retrieval_row = (by_metric.get(getattr(cfg.model, 'retrieval_metric', None))
                      if hasattr(model, 'sample') else None)
-    return {'model': cfg.model_type, 'epoch': ckpt.get('epoch'), 'saved_metrics': ckpt.get('metrics'),
-            'seeds': seeds, 'retrieval_row': retrieval_row,
+    return {'model': cfg.model_type, 'runs': runs, 'seeds': seeds, 'retrieval_row': retrieval_row,
             'results': results}
 
 
@@ -329,27 +345,36 @@ def _format_table(rows: dict[str, dict[str, list[float]]]) -> str:
         return f'{head}\n{body}'
 
 
-def _print_report(report: dict, checkpoint_path: str) -> None:
-    seeds, n = report['seeds'], len(report['seeds'])
-    print(f'\n{report["model"]} | {checkpoint_path} | эпоха {report["epoch"]} | '
-          f'{n} сидов сэмплинга: {seeds}')
+def _print_report(report: dict) -> None:
+    seeds, runs = report['seeds'], report['runs']
+    n_seeds, n_runs = len(seeds), len(runs)
+    print(f'\n{report["model"]} | прогонов: {n_runs} — '
+          + ', '.join(f'{r["name"]} (эпоха {r["epoch"]})' for r in runs))
+    print(f'Сиды сэмплинга: {seeds} → запусков на сплит: {n_runs * n_seeds}')
 
     for split, rows in report['results'].items():
-        print(f'\n=== {split.upper()} ===')
+        print(f'\n=== {split.upper()} === mean ± std по всем запускам ({n_runs} × {n_seeds})')
         print(_format_table(rows))
         row = report.get('retrieval_row') or next(iter(rows))
-        if n > 1 and 'NDCG@20' in rows[row]:
-            mean, std = _mean_std(rows[row]['NDCG@20'])
-            half = _t_quantile_975(n - 1) * std / math.sqrt(n)
-            print(f'95% ДИ для NDCG@20 ({row}): [{mean - half:.4f}, {mean + half:.4f}]')
+        if 'NDCG@20' not in rows[row]:
+            continue
+        # Значения идут прогон за прогоном, по n_seeds на прогон
+        values  = rows[row]['NDCG@20']
+        per_run = [_mean_std(values[i * n_seeds:(i + 1) * n_seeds])[0] for i in range(n_runs)]
+        print(f'NDCG@20 ({row}) по прогонам (среднее по сидам): '
+              + ', '.join(f'{r["name"]} {m:.4f}' for r, m in zip(runs, per_run)))
+        if n_runs > 1:
+            # Запуски одного прогона не независимы, поэтому ДИ — по средним прогонов
+            mean, std = _mean_std(per_run)
+            half = _t_quantile_975(n_runs - 1) * std / math.sqrt(n_runs)
+            print(f'95% ДИ для NDCG@20 ({row}) по средним прогонов: [{mean - half:.4f}, {mean + half:.4f}]')
 
-    saved = report['saved_metrics'] or {}
-    val   = report['results'].get('val')
-    if val and 'NDCG@20' in saved:
-        row = report.get('retrieval_row') or next(iter(val))
-        print(f'\nПроверка: val NDCG@20 ({row}) при сиде {seeds[0]} = {val[row]["NDCG@20"][0]:.4f}, '
-              f'в чекпойнте {saved["NDCG@20"]:.4f}')
-    print('Разброс отражает только шум сэмплинга: различия между обучениями с разными сидами он не учитывает.')
+    saved = [f'{r["name"]} {r["saved_metrics"]["NDCG@20"]:.4f}'
+             for r in runs if 'NDCG@20' in (r['saved_metrics'] or {})]
+    if saved:
+        print('\nДля справки, val NDCG@20 из чекпойнтов (сид тренера 42, ретривал из его конфига): '
+              + ', '.join(saved))
+    print('std учитывает и разброс между обучениями, и шум сэмплинга.')
 
 
 # --------------------------------------------------------------------------- #
@@ -466,10 +491,11 @@ def _self_test() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description='Метрики чекпойнта на val/test по протоколу тренера с разбросом по сидам сэмплинга.')
-    parser.add_argument('--config', help='yaml, с которым обучалась модель (configs/...)')
-    parser.add_argument('--checkpoint', help='путь к best.pt или latest.pt')
-    parser.add_argument('--seeds', type=int, default=5, help='число сидов сэмплинга: 42, 142, 242, ... (по умолчанию 5)')
+        description='Метрики прогонов модели на val/test по протоколу тренера с разбросом '
+                    'по прогонам и сидам сэмплинга.')
+    parser.add_argument('--config', help='yaml, с которым обучалась модель (configs/<model>.yaml)')
+    parser.add_argument('--n-runs', type=int, help='сколько прогонов взять: best.pt из <model>_1 … <model>_N')
+    parser.add_argument('--seeds', type=int, default=5, help='число сидов сэмплинга: 1, 2, 3, ... (по умолчанию 5)')
     parser.add_argument('--splits', nargs='+', default=['val', 'test'], choices=['val', 'test'])
     parser.add_argument('--self-test', action='store_true', help='проверить формулы HR/NDCG и выйти')
     args = parser.parse_args()
@@ -477,12 +503,11 @@ def main() -> None:
     if args.self_test:
         _self_test()
         return
-    if not args.config or not args.checkpoint:
-        parser.error('нужны --config и --checkpoint (или --self-test)')
+    if not args.config or not args.n_runs:
+        parser.error('нужны --config и --n-runs (или --self-test)')
 
-    report = evaluate_checkpoint(args.config, args.checkpoint, n_seeds=args.seeds,
-                                 splits=tuple(args.splits))
-    _print_report(report, args.checkpoint)
+    report = evaluate_runs(args.config, n_runs=args.n_runs, n_seeds=args.seeds, splits=tuple(args.splits))
+    _print_report(report)
 
 
 if __name__ == '__main__':

@@ -1,4 +1,4 @@
-seed: 142
+seed: 42
 model_type: dreamrec_alphafuse
 
 data:
@@ -31,7 +31,7 @@ optimizer:
   lr: 1e-4
   weight_decay: 0.0
   grad_clip: 1.0
-  num_epochs: 500      # в AlphaFuse — максимум, дальше early stopping (patience 50 проверок)
+  num_epochs: 200      # в AlphaFuse — максимум, дальше early stopping (patience 50 проверок)
   warmup_epochs: 0
   ema_decay: null       # null — без EMA; 0.999 — полураспад ≈ 690 шагов (≈12 эпох)
 
