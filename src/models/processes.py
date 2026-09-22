@@ -9,7 +9,8 @@
     DDPM          x_t = √ᾱ_t·x_0 + √(1−ᾱ_t)·ε, t ∈ {0..T−1}; сеть предсказывает x_0;
                   сэмплинг — ancestral DDPM по (прорежённой) сетке шагов.
     FlowMatching  z_τ = (1−τ)·z_0 + τ·z_1, z_0 ~ N(0, I); сеть предсказывает скорость
-                  u = z_1 − z_0; сэмплинг — Euler ODE от τ=0 к τ=1.
+                  u = z_1 − z_0 (prediction='velocity') или z_1 (prediction='x1');
+                  сэмплинг — Euler ODE от τ=0 к τ=1.
 """
 
 from __future__ import annotations
@@ -116,17 +117,39 @@ class DDPM(nn.Module):
 # Flow Matching
 # --------------------------------------------------------------------------- #
 
+FM_PREDICTIONS = ('velocity', 'x1')
+
+
 class FlowMatching(nn.Module):
-    """Conditional Flow Matching (rectified flow) с velocity-параметризацией."""
+    """
+    Conditional Flow Matching (rectified flow). Что предсказывает сеть — задаёт prediction:
+
+        velocity  f ≈ u = z_1 − z_0;              скорость для ODE — сам выход сети
+        x1        f ≈ z_1 (эмбеддинг товара);      скорость для ODE — (f − z_τ) / (1 − τ)
+
+    При точном предсказании обе дают одно и то же поле скоростей; различаются loss
+    (ошибка в x1 весит в скорости как 1/(1 − τ)) и тем, что учит сеть.
+    """
 
     DEFAULT_STEPS = 50
 
+    def __init__(self, prediction: str = 'velocity'):
+        super().__init__()
+        if prediction not in FM_PREDICTIONS:
+            raise ValueError(f'prediction должен быть одним из {FM_PREDICTIONS}, получено {prediction!r}')
+        self.prediction = prediction
+
     def loss(self, denoiser: ConcatDenoiser, x_clean: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-        """L = E_{τ,z_0} ‖(z_1 − z_0) − f((1−τ)·z_0 + τ·z_1, h, τ)‖², z_1 = x_clean."""
+        """
+        z_1 = x_clean, z_τ = (1−τ)·z_0 + τ·z_1:
+            velocity  L = E_{τ,z_0} ‖(z_1 − z_0) − f(z_τ, h, τ)‖²
+            x1        L = E_{τ,z_0} ‖z_1 − f(z_τ, h, τ)‖²
+        """
         z0    = torch.randn_like(x_clean)
         tau   = torch.rand(x_clean.shape[0], device=x_clean.device)
         z_tau = (1.0 - tau[:, None]) * z0 + tau[:, None] * x_clean
-        return F.mse_loss(denoiser(z_tau, h, tau), x_clean - z0)
+        target = x_clean - z0 if self.prediction == 'velocity' else x_clean
+        return F.mse_loss(denoiser(z_tau, h, tau), target)
 
     @torch.no_grad()
     def sample(
@@ -136,14 +159,24 @@ class FlowMatching(nn.Module):
         num_steps: int | None = None,
         w_cfg: float = 0.0,
     ) -> torch.Tensor:
-        """Euler ODE от шума (τ=0) к эмбеддингу товара (τ=1) за num_steps шагов."""
+        """
+        Euler ODE от шума (τ=0) к эмбеддингу товара (τ=1) за num_steps шагов.
+        τ шага не больше 1 − 1/num_steps, так что деление на 1 − τ при x1 безопасно.
+        """
         n  = num_steps or self.DEFAULT_STEPS
         dt = 1.0 / n
         z  = torch.randn_like(h)
         for i in range(n):
             tau = torch.full((h.shape[0],), i * dt, device=h.device)
-            z   = z + dt * denoiser.guided(z, h, tau, w_cfg)
+            z   = z + dt * self.velocity(denoiser, z, h, tau, w_cfg)
         return z
 
+    @torch.no_grad()
+    def velocity(self, denoiser: ConcatDenoiser, z: torch.Tensor, h: torch.Tensor,
+                 tau: torch.Tensor, w_cfg: float = 0.0) -> torch.Tensor:
+        """Скорость ODE в z_τ: выход сети (velocity) или (x̂_1 − z_τ) / (1 − τ) (x1)."""
+        out = denoiser.guided(z, h, tau, w_cfg)
+        return out if self.prediction == 'velocity' else (out - z) / (1.0 - tau[:, None])
+
     def config(self) -> dict:
-        return {'process': 'flow_matching'}
+        return {'process': 'flow_matching', 'prediction': self.prediction}

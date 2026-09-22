@@ -169,7 +169,7 @@ class DreamRecFMText(GenerativeRecommender):
 
     def __init__(self, *, item_embeddings_raw: np.ndarray, padding_idx: int, use_pca: bool,
                  n_components: int, per_component_whitening: bool, whitening_cache: str | Path,
-                 n_heads: int, d_ff: int, dropout: float, max_seq_len: int,
+                 n_heads: int, d_ff: int, dropout: float, max_seq_len: int, prediction: str,
                  p_uncond: float, w_cfg: float, retrieval_metric: str):
         items = ItemEmbedding.text(item_embeddings_raw, padding_idx, use_pca, n_components,
                                    per_component_whitening, whitening_cache)
@@ -177,7 +177,7 @@ class DreamRecFMText(GenerativeRecommender):
             items=items,
             encoder=HistoryEncoder(items.d_emb, n_heads, d_ff, dropout, max_seq_len),
             denoiser=ConcatDenoiser(items.d_emb),
-            process=FlowMatching(),
+            process=FlowMatching(prediction),
             p_uncond=p_uncond, w_cfg=w_cfg, retrieval_metric=retrieval_metric,
         )
 
@@ -236,9 +236,10 @@ if __name__ == '__main__':
                                                per_component_whitening=True,
                                                whitening_cache=Path(tmp) / 'wh.npz', T=50,
                                                beta_schedule='linear', **common),
-            'DreamRecFMText': DreamRecFMText(item_embeddings_raw=emb_raw, use_pca=True, n_components=D,
-                                             per_component_whitening=False,
-                                             whitening_cache=Path(tmp) / 'wh.npz', **common),
+            **{f'DreamRecFMText ({pred})': DreamRecFMText(
+                item_embeddings_raw=emb_raw, use_pca=True, n_components=D, per_component_whitening=False,
+                whitening_cache=Path(tmp) / 'wh.npz', prediction=pred, **common)
+               for pred in ('velocity', 'x1')},
             **{f'DreamRecAlphaFuse ({fusion})': DreamRecAlphaFuse(
                 item_embeddings_raw=emb_raw, d_emb=D, null_dim=6, null_thres=None, fusion=fusion,
                 id_init='zeros', whitening_cache=Path(tmp) / 'wh.npz', T=50, beta_schedule='linear',

@@ -221,6 +221,7 @@ class DreamRecFMTextModelConfig:
     n_heads:                 int
     d_ff:                    int
     dropout:                 float
+    prediction:              str      # velocity — сеть предсказывает z_1 − z_0; x1 — сам z_1
     p_uncond:                float
     w_cfg:                   float
     retrieval_metric:        str      # cosine, dot, l2
@@ -247,6 +248,7 @@ def build_dreamrec_fm_text(cfg: DreamRecFMTextConfig) -> DreamRecFMText:
         d_ff=m.d_ff,
         dropout=m.dropout,
         max_seq_len=cfg.data.max_seq_len,
+        prediction=m.prediction,
         p_uncond=m.p_uncond,
         w_cfg=m.w_cfg,
         retrieval_metric=m.retrieval_metric,
