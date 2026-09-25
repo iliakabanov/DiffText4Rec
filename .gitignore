@@ -6,3 +6,5 @@
 *.npz
 checkpoints/
 .vscode/
+.pytest_cache/
+data/
