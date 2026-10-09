@@ -2,24 +2,25 @@ seed: 42
 model_type: sasrec
 
 data:
-  data_dir: ./data/ATG
-  padding_idx: 11924
-  n_items: 11924
+  data_dir: ./data/processed/toys
+  padding_idx: 20259       # = item_num из data_statis.df
+  n_items: 20259
   batch_size: 256
   num_workers: 4
-  max_seq_len: 10
+  max_seq_len: 49          # окно истории; = seq_size из data_statis.df, длиннее историй в данных нет
 
 model:
   d_model: 128
-  n_heads: 1
-  n_layers: 1
-  d_ff: 128
-  dropout: 0.1
+  n_heads: 2
+  n_layers: 2
+  d_ff: 512
+  dropout: 0.2
   tie_weights: true
   loss: infonce
   neg_ratio: 64
   temperature: 0.07
-  retrieval_metric: dot   # cosine, dot
+  retrieval_metric: cosine   # cosine, dot
+  train_prefixes: true    # лосс на каждой позиции истории за один forward
 
 optimizer:
   name: adam           # adam — weight_decay как L2 в градиенте; adamw — развязанный decay
@@ -31,9 +32,9 @@ optimizer:
   ema_decay: null       # null — без EMA; 0.999 — полураспад ≈ 690 шагов (≈12 эпох)
 
 eval:
-  every_epochs: 10
+  every_epochs: 1
   top_k: [10, 20]
 
 output:
-  dir: ./checkpoints
-  run_name: sasrec
+  dir: ./checkpoints/toys
+  run_name: sasrec_posloss_3

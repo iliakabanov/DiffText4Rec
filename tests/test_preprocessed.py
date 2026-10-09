@@ -11,8 +11,8 @@
 Сверка с сырыми JSONL (маркер raw; один проход по ~10 ГБ, около минуты):
     ожидаемые значения считаются заново прямо по сырым строкам — без кэша ноутбука и без кода
     preprocess.py, только его пороги. Для выборки:
-      * пользователей из sequences.df — seq совпадает с последними MAX_SEQ_LEN товарами их сырой
-        истории (дедуп, rating > порога, только товары из items.parquet, по времени);
+      * пользователей из sequences.df — seq совпадает с их сырой историей (дедуп, rating > порога,
+        только товары из items.parquet, по времени);
       * пользователей, которых нет в sequences.df, — у них действительно < MIN_USER_INTERACTIONS
         подходящих взаимодействий;
       * товаров из items.parquet — у них ≥ MIN_ITEM_INTERACTIONS положительных отзывов во всех данных;
@@ -76,8 +76,8 @@ def inter() -> pd.DataFrame:
 
 
 @pytest.fixture(scope='module')
-def seq_array(seqs) -> np.ndarray:
-    return np.array(seqs['seq'].tolist())
+def seq_lists(seqs) -> list[list[int]]:
+    return [list(s) for s in seqs['seq']]
 
 
 @pytest.fixture(scope='module')
@@ -86,15 +86,14 @@ def splits() -> dict[str, pd.DataFrame]:
 
 
 @pytest.fixture(scope='module')
-def full_sequences(seqs, seq_array) -> dict[str, list[int]]:
-    """user_id → полная последовательность id товаров без паддинга (из sequences.df)."""
-    return {u: q[len(q) - n:].tolist()
-            for u, q, n in zip(seqs['user_id'], seq_array, seqs['len_seq'])}
+def full_sequences(seqs, seq_lists) -> dict[str, list[int]]:
+    """user_id → полная последовательность id товаров (из sequences.df)."""
+    return dict(zip(seqs['user_id'], seq_lists))
 
 
-def test_statis(statis, items):
+def test_statis(statis, items, splits):
     assert statis['item_num'] == len(items)
-    assert statis['seq_size'] == P.MAX_SEQ_LEN - 1, 'один товар всегда уходит в next'
+    assert statis['seq_size'] == max(int(s['len_seq'].max()) for s in splits.values())
 
 
 def test_items_unique(items):
@@ -122,26 +121,19 @@ def test_sequences_columns(seqs):
     assert list(seqs.columns) == ['user_id', 'seq', 'len_seq']
 
 
-def test_sequences_shape(seq_array, seqs):
-    assert seq_array.shape == (len(seqs), P.MAX_SEQ_LEN)
+def test_sequences_len_matches_seq(seq_lists, seqs):
+    """Истории хранятся без паддинга: len_seq — это и есть длина списка."""
+    assert [len(s) for s in seq_lists] == seqs['len_seq'].tolist()
+    assert seqs['len_seq'].min() >= min(P.MIN_USER_INTERACTIONS, P.MAX_SEQ_LEN or np.inf)
+    if P.MAX_SEQ_LEN is not None:
+        assert seqs['len_seq'].max() <= P.MAX_SEQ_LEN
 
 
-def test_sequences_len_bounds(seqs):
-    lens = seqs['len_seq']
-    assert lens.min() >= P.MIN_USER_INTERACTIONS
-    assert lens.max() <= P.MAX_SEQ_LEN
-
-
-def test_sequences_left_padding(seq_array, seqs, statis):
-    size, lens = P.MAX_SEQ_LEN, seqs['len_seq'].to_numpy()
-    pad = seq_array == statis['item_num']
-    assert (pad == (np.arange(size) < (size - lens)[:, None])).all()
-
-
-def test_sequences_item_ids(seq_array, statis):
-    item_num = statis['item_num']
-    assert seq_array.min() >= 0 and seq_array.max() <= item_num
-    assert np.unique(seq_array[seq_array != item_num]).size == item_num, 'встречаются не все товары'
+def test_sequences_item_ids(seq_lists, statis):
+    """Все id — настоящие товары: паддинга (id = item_num) в файлах нет."""
+    ids = np.concatenate([np.asarray(s) for s in seq_lists])
+    assert ids.min() >= 0 and ids.max() < statis['item_num']
+    assert np.unique(ids).size == statis['item_num'], 'встречаются не все товары'
 
 
 def test_sequences_users_sorted_unique(seqs):
@@ -153,15 +145,13 @@ def test_sequences_total_equals_interactions(seqs, inter):
     assert seqs['len_seq'].sum() == len(inter)
 
 
-def test_sequences_match_interactions(seqs, seq_array, inter, items):
+def test_sequences_match_interactions(seqs, seq_lists, inter, items):
     """Все последовательности: interactions по (user_id, timestamp), переведённые в id товаров."""
-    size = P.MAX_SEQ_LEN
     item_id = pd.Series(np.arange(len(items)), index=items['parent_asin'])
     s = inter.sort_values(['user_id', 'timestamp'], kind='stable')
     rebuilt = pd.Series(item_id[s['parent_asin']].to_numpy()).groupby(s['user_id'].to_numpy()).agg(list)
     assert rebuilt.index.tolist() == seqs['user_id'].tolist()
-    bad = [u for u, r, q, n in zip(seqs['user_id'], rebuilt, seq_array, seqs['len_seq'])
-           if r != q[size - n:].tolist()]
+    bad = [u for u, r, q in zip(seqs['user_id'], rebuilt, seq_lists) if r != q]
     assert not bad, f'расхождений {len(bad)}, первые: {bad[:5]}'
 
 
@@ -171,17 +161,16 @@ def test_sequences_match_interactions(seqs, seq_array, inter, items):
 
 @pytest.mark.parametrize('name', SPLIT_NAMES)
 def test_split_format(name, splits, statis):
-    """Столбцы, длина истории, паддинг слева, допустимые id."""
+    """Столбцы, длины историй без паддинга, допустимые id."""
     s = splits[name]
-    size, item_num = statis['seq_size'], statis['item_num']
+    item_num = statis['item_num']
     assert list(s.columns) == P.SPLIT_COLUMNS
-    arr, lens = np.array(s['seq'].tolist()), s['len_seq'].to_numpy()
-    assert arr.shape == (len(s), size)
-    assert lens.min() >= 1 and lens.max() <= size
-    pad = arr == item_num
-    assert (pad == (np.arange(size) < (size - lens)[:, None])).all(), 'паддинг не слева'
-    assert arr.min() >= 0 and arr.max() <= item_num
-    assert s['next'].between(0, item_num - 1).all(), 'таргет вне каталога или паддинг'
+    lens = s['len_seq'].to_numpy()
+    assert [len(q) for q in s['seq']] == lens.tolist(), 'len_seq не равна длине seq'
+    assert lens.min() >= 1 and lens.max() <= statis['seq_size']
+    ids = np.concatenate([np.asarray(q) for q in s['seq']])
+    assert ids.min() >= 0 and ids.max() < item_num, 'в истории есть id вне каталога (паддинг?)'
+    assert s['next'].between(0, item_num - 1).all(), 'таргет вне каталога'
     assert s['user_id'].isin(splits['test']['user_id']).all()
 
 
@@ -191,15 +180,15 @@ def test_split_leave_one_out(splits, full_sequences):
     for name, drop in (('test', 0), ('val', 1)):
         s = splits[name]
         assert len(s) == len(full_sequences), 'в val/test должен быть каждый пользователь'
-        bad = [u for u, seq, n, nxt in zip(s['user_id'], s['seq'], s['len_seq'], s['next'])
-               if list(seq[len(seq) - n:]) + [nxt] != full_sequences[u][:len(full_sequences[u]) - drop]]
+        bad = [u for u, seq, nxt in zip(s['user_id'], s['seq'], s['next'])
+               if list(seq) + [nxt] != full_sequences[u][:len(full_sequences[u]) - drop]]
         assert not bad, f'{name}: расхождений {len(bad)}, первые: {bad[:3]}'
 
     train = splits['train']
-    expected = {u: (len(items) - 3 if P.TRAIN_PREFIXES else 1) for u, items in full_sequences.items()}
+    expected = {u: (len(items) - 3 if P.PREFIXES_SEPARATELY else 1) for u, items in full_sequences.items()}
     assert train['user_id'].value_counts().to_dict() == expected, 'не столько примеров на пользователя'
     bad = [u for u, seq, n, nxt in zip(train['user_id'], train['seq'], train['len_seq'], train['next'])
-           if list(seq[len(seq) - n:]) + [nxt] != full_sequences[u][:n + 1]]
+           if list(seq) + [nxt] != full_sequences[u][:n + 1]]
     assert not bad, f'train: расхождений {len(bad)}, первые: {bad[:3]}'
     # Таргеты train — строго раньше val и test того же пользователя
     last_train = train.groupby('user_id')['len_seq'].max().add(1)
@@ -218,24 +207,20 @@ def test_split_users(splits, full_sequences):
         assert s['user_id'].is_unique
         frac = len(s) / len(full_sequences)
         assert abs(frac - P.SPLIT_FRACTIONS[name]) < 0.01, f'{name}: доля {frac:.3f}'
-        bad = [u for u, seq, n, nxt in zip(s['user_id'], s['seq'], s['len_seq'], s['next'])
-               if list(seq[len(seq) - n:]) + [nxt] != full_sequences[u]]
+        bad = [u for u, seq, nxt in zip(s['user_id'], s['seq'], s['next'])
+               if list(seq) + [nxt] != full_sequences[u]]
         assert not bad, f'{name}: расхождений {len(bad)}'
 
 
-PAD = 6      # item_num в синтетических примерах
-
-
 def _synthetic(monkeypatch, split_mode: str, lens=(5, 4, 4, 4)) -> pd.DataFrame:
-    """Четыре пользователя, MAX_SEQ_LEN = 5, каталог из PAD товаров."""
+    """Несколько пользователей с историями заданных длин, без паддинга."""
     monkeypatch.setattr(P, 'SPLIT', split_mode)
-    monkeypatch.setattr(P, 'MAX_SEQ_LEN', 5)
-    monkeypatch.setattr(P, 'TRAIN_PREFIXES', True)
+    monkeypatch.setattr(P, 'PREFIXES_SEPARATELY', True)
     monkeypatch.setattr(P, 'SPLIT_FRACTIONS', {'train': 0.5, 'val': 0.25, 'test': 0.25})
     items = {5: [0, 1, 2, 3, 4], 4: [4, 0, 2, 1], 3: [1, 3, 4], 2: [2, 0]}
     return pd.DataFrame({
         'user_id': [f'u{k + 1}' for k in range(len(lens))],
-        'seq':     [[PAD] * (5 - n) + items[n] for n in lens],
+        'seq':     [items[n] for n in lens],
         'len_seq': list(lens),
     })
 
@@ -247,23 +232,23 @@ def _rows(split: pd.DataFrame) -> list[tuple]:
 
 def test_build_splits_synthetic_leave_one_out(monkeypatch):
     """u1 = [0,1,2,3,4]: train [0]→1 и [0,1]→2, val [0,1,2]→3, test [0,1,2,3]→4."""
-    splits = P.build_splits(_synthetic(monkeypatch, 'leave_one_out', lens=(5, 4)), PAD)
-    assert _rows(splits['train']) == [('u1', [PAD, PAD, PAD, 0], 1, 1),
-                                      ('u1', [PAD, PAD, 0, 1], 2, 2),
-                                      ('u2', [PAD, PAD, PAD, 4], 1, 0)]
-    assert _rows(splits['val']) == [('u1', [PAD, 0, 1, 2], 3, 3),
-                                    ('u2', [PAD, PAD, 4, 0], 2, 2)]
+    splits = P.build_splits(_synthetic(monkeypatch, 'leave_one_out', lens=(5, 4)))
+    assert _rows(splits['train']) == [('u1', [0], 1, 1),
+                                      ('u1', [0, 1], 2, 2),
+                                      ('u2', [4], 1, 0)]
+    assert _rows(splits['val']) == [('u1', [0, 1, 2], 3, 3),
+                                    ('u2', [4, 0], 2, 2)]
     assert _rows(splits['test']) == [('u1', [0, 1, 2, 3], 4, 4),
-                                     ('u2', [PAD, 4, 0, 2], 3, 1)]
+                                     ('u2', [4, 0, 2], 3, 1)]
 
 
 def test_build_splits_single_train_example(monkeypatch):
-    """Без TRAIN_PREFIXES — по одному примеру на пользователя: последний доступный таргет."""
+    """Без PREFIXES_SEPARATELY — по одному примеру на пользователя: последний доступный таргет."""
     sequences = _synthetic(monkeypatch, 'leave_one_out', lens=(5, 4))
-    monkeypatch.setattr(P, 'TRAIN_PREFIXES', False)
-    splits = P.build_splits(sequences, PAD)
-    assert _rows(splits['train']) == [('u1', [PAD, PAD, 0, 1], 2, 2),
-                                      ('u2', [PAD, PAD, PAD, 4], 1, 0)]
+    monkeypatch.setattr(P, 'PREFIXES_SEPARATELY', False)
+    splits = P.build_splits(sequences)
+    assert _rows(splits['train']) == [('u1', [0, 1], 2, 2),
+                                      ('u2', [4], 1, 0)]
 
 
 @pytest.mark.parametrize('lens', [(5, 3), (5, 2)])
@@ -271,18 +256,18 @@ def test_build_splits_rejects_short_sequences(monkeypatch, lens):
     """При < 4 взаимодействиях leave_one_out невозможен: нет train-примеров или пустая история."""
     sequences = _synthetic(monkeypatch, 'leave_one_out', lens=lens)
     with pytest.raises(ValueError, match='leave_one_out'):
-        P.build_splits(sequences, PAD)
+        P.build_splits(sequences)
 
 
 def test_build_splits_synthetic_users(monkeypatch):
     """Режим users: один пример на пользователя (вся история → последний товар), сплиты не пересекаются."""
-    splits = P.build_splits(_synthetic(monkeypatch, 'users'), PAD)
+    splits = P.build_splits(_synthetic(monkeypatch, 'users'))
     assert [len(s) for s in splits.values()] == [2, 1, 1]
     users = {u for s in splits.values() for u in s['user_id']}
     assert users == {'u1', 'u2', 'u3', 'u4'}
     everything = {r[0]: r for s in splits.values() for r in _rows(s)}
     assert everything['u1'] == ('u1', [0, 1, 2, 3], 4, 4)        # последний товар 4 — в next
-    assert everything['u2'] == ('u2', [PAD, 4, 0, 2], 3, 1)
+    assert everything['u2'] == ('u2', [4, 0, 2], 3, 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -291,9 +276,13 @@ def test_build_splits_synthetic_users(monkeypatch):
 
 @pytest.mark.parametrize('path', sorted(OUT.glob('*_text*.pickle')), ids=lambda p: p.name)
 def test_embeddings_row_per_item(path, statis):
+    """Строка матрицы = строка items.parquet. Иначе эмбеддинги от другого состава товаров."""
     with open(path, 'rb') as f:
         emb = pickle.load(f)
-    assert emb.shape[0] == statis['item_num']
+    assert emb.shape[0] == statis['item_num'], (
+        f'{path.name}: {emb.shape[0]:,} строк против {statis["item_num"]:,} товаров — эмбеддинги '
+        f'устарели после предобработки; удалите {path.name} и папку {path.stem}_chunks '
+        f'и пересчитайте: python scripts/embed_items.py')
 
 
 # --------------------------------------------------------------------------- #
@@ -371,13 +360,15 @@ def raw_meta(sample) -> dict:
 
 @pytest.mark.raw
 def test_raw_user_sequences(sample, raw_reviews, items):
-    """seq пользователя = последние MAX_SEQ_LEN товаров его сырой истории."""
+    """seq пользователя = его сырая история (последние MAX_SEQ_LEN товаров, если задан)."""
     keep, asin = set(items['parent_asin']), items['parent_asin'].to_numpy()
     users = sample['users']
     bad = []
-    for u, seq, n in zip(users['user_id'], users['seq'], users['len_seq']):
-        expected = expected_history(raw_reviews['users'][u], keep)[-P.MAX_SEQ_LEN:]
-        got = [asin[i] for i in seq[len(seq) - n:]]
+    for u, seq in zip(users['user_id'], users['seq']):
+        expected = expected_history(raw_reviews['users'][u], keep)
+        if P.MAX_SEQ_LEN is not None:
+            expected = expected[-P.MAX_SEQ_LEN:]
+        got = [asin[i] for i in seq]
         if got != expected:
             bad.append((u, got, expected))
     assert not bad, f'расхождений {len(bad)} из {len(users)}, первое: {bad[0]}'

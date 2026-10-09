@@ -4,21 +4,31 @@
     1. колонки user_id, parent_asin, timestamp (+ rating до фильтра по нему);
     2. дедупликация по DEDUP_SUBSET;
     3. фильтр по рейтингу: rating > RATING_THRESHOLD;
-    4. товары с ≥ MIN_ITEM_INTERACTIONS взаимодействиями — популярность считается по всем данным
-       после шага 3, до фильтра пользователей;
-    5. пользователи с ≥ MIN_USER_INTERACTIONS взаимодействиями (после шага 4);
-    6. у каждого пользователя — последние MAX_SEQ_LEN взаимодействий по времени;
+    4–5. фильтр товаров и пользователей, способ — FILTER;
+    6. у каждого пользователя — последние MAX_SEQ_LEN взаимодействий по времени (None — не обрезать);
     7. текстовые описания оставшихся товаров (src/item_text.py, параметры — TEXT);
-    8. последовательности пользователей и сплит train / val / test в формате датасетов
-       AlphaFuse / iDreamRec (data/ATG), способ — SPLIT.
+    8. последовательности пользователей и сплит train / val / test, способ — SPLIT.
 
-Шаги 4–5 — по одному проходу, без итераций k-core: популярность — свойство товара, и мерится
-она по всем покупателям, а не только по тем, кто остался в датасете. Поэтому у пользователей
-гарантированно ≥ MIN_USER_INTERACTIONS взаимодействий, а у товара в итоговых данных их может быть
-меньше MIN_ITEM_INTERACTIONS (часть покупателей — пользователи с короткой историей, убранные на шаге 5).
+Паддинга в файлах нет: seq — список id товаров переменной длины по времени. Паддить до окна
+модели — дело data.ATGDataset, id паддинга = item_num.
+
+Фильтр (FILTER):
+    global — по одному проходу: сначала товары с ≥ MIN_ITEM_INTERACTIONS взаимодействиями (считаются
+             по всем данным после шага 3, до фильтра пользователей), затем пользователи с
+             ≥ MIN_USER_INTERACTIONS. Популярность — свойство товара, и мерится она по всем
+             покупателям, а не только по оставшимся в датасете. Поэтому у пользователей
+             гарантированно ≥ MIN_USER_INTERACTIONS взаимодействий, а у товара в итоговых данных
+             их может быть меньше MIN_ITEM_INTERACTIONS: часть его покупателей — пользователи с
+             короткой историей, убранные фильтром пользователей;
+    k_core — итеративно: удаление редких товаров снижает счётчики пользователей и наоборот, проход
+             повторяется, пока ничего не меняется. В итоге пороги выполнены и по пользователям, и
+             по товарам, но датасет заметно меньше: вместе с редкими уходят и популярные товары,
+             чьи покупатели не прошли фильтр. Это стандарт в статьях (AlphaFuse и другие).
+
 
 После каждого шага в лог пишется число строк (доля от предыдущего шага и от исходных),
-пользователей и товаров.
+пользователей и товаров, а в конце — итоговая сводка по датасету: пользователи, товары,
+взаимодействия, средняя длина последовательности и разреженность.
 
 Выход (OUT_DIR):
     interactions.parquet — user_id, parent_asin, timestamp;
@@ -26,18 +36,19 @@
                            Номер строки — id товара в сплитах и строка матрицы эмбеддингов
                            (scripts/embed_items.py);
     sequences.df         — полные последовательности без сплита (для анализа): строка — пользователь,
-                           user_id, seq (длина MAX_SEQ_LEN, паддинг слева id = item_num), len_seq;
-    {train,val,test}_data.df — сплит в формате data/ATG (+ столбец user_id): строка — один обучающий
-                           или тестовый пример: seq (история, длина seq_size = MAX_SEQ_LEN − 1,
-                           паддинг слева), len_seq (число настоящих товаров истории), next (таргет);
-    data_statis.df       — seq_size (= MAX_SEQ_LEN − 1), item_num (= число товаров = id паддинга);
+                           user_id, seq (id товаров по времени, без паддинга), len_seq;
+    {train,val,test}_data.df — сплит (столбцы как в data/ATG плюс user_id): строка — один обучающий
+                           или тестовый пример: seq (история, список переменной длины по времени),
+                           len_seq (её длина), next (таргет);
+    data_statis.df       — seq_size (самая длинная история в сплитах — справочно, для max_seq_len
+                           модели), item_num (= число товаров = id паддинга);
     preprocess.log.
 
 Сплит (SPLIT):
     leave_one_out — последнее взаимодействие пользователя в test, предпоследнее в val, остальные
-                    в train; пользователи во всех сплитах одни и те же. При TRAIN_PREFIXES в train
-                    идут все префиксы истории (как в оригинальном DreamRec), иначе один пример на
-                    пользователя — последний доступный для обучения таргет;
+                    в train; пользователи во всех сплитах одни и те же. При PREFIXES_SEPARATELY в train
+                    идут все префиксы истории (как в оригинальном DreamRec), иначе (по умолчанию)
+                    один пример на пользователя — последний доступный для обучения таргет;
     users         — как в data/ATG: у пользователя один пример (вся история → последний товар),
                     сами пользователи делятся в долях SPLIT_FRACTIONS, сплиты не пересекаются
                     (протокол холодного старта по пользователям).
@@ -75,12 +86,14 @@ OUT_DIR     = ROOT / 'data/processed/toys'
 # ('user_id', 'parent_asin') — ещё и повторные отзывы на товар в другое время (остаётся самый ранний)
 DEDUP_SUBSET          = ('user_id', 'parent_asin', 'timestamp')
 RATING_THRESHOLD      = 3.0     # остаются отзывы с rating > RATING_THRESHOLD
-MIN_ITEM_INTERACTIONS = 5       # товары с ≥ MIN_ITEM_INTERACTIONS взаимодействиями (по всем данным)
-MIN_USER_INTERACTIONS = 5       # пользователи с ≥ MIN_USER_INTERACTIONS взаимодействиями
-MAX_SEQ_LEN           = 12      # у пользователя остаются последние MAX_SEQ_LEN взаимодействий
+MIN_ITEM_INTERACTIONS = 10       # товары с ≥ MIN_ITEM_INTERACTIONS взаимодействиями (по всем данным)
+MIN_USER_INTERACTIONS = 10       # пользователи с ≥ MIN_USER_INTERACTIONS взаимодействиями
+MAX_SEQ_LEN           = 50      # у пользователя остаются последние MAX_SEQ_LEN взаимодействий; None — все
+FILTER                = 'k_core'   # global или k_core (см. docstring)
 
 SPLIT                 = 'leave_one_out'   # leave_one_out или users (см. docstring)
-TRAIN_PREFIXES        = True    # leave_one_out: все префиксы истории в train, а не один пример на пользователя
+PREFIXES_SEPARATELY   = False   # leave_one_out: каждый префикс истории — отдельная строка train,
+                                # а не один пример на пользователя
 SPLIT_FRACTIONS       = {'train': 0.8, 'val': 0.1, 'test': 0.1}   # только для SPLIT='users'
 SPLIT_SEED            = 42
 
@@ -176,6 +189,36 @@ def keep_frequent(df: pd.DataFrame, col: str, min_count: int) -> pd.DataFrame:
     return df[np.bincount(codes)[codes] >= min_count].reset_index(drop=True)
 
 
+def k_core(df: pd.DataFrame, min_user: int, min_item: int, max_iter: int = 200) -> pd.DataFrame:
+    """Итеративно убирает пользователей с < min_user и товары с < min_item взаимодействиями."""
+    for it in range(1, max_iter + 1):
+        u = df['user_id'].cat.codes.to_numpy()
+        i = df['parent_asin'].cat.codes.to_numpy()
+        keep = (np.bincount(u)[u] >= min_user) & (np.bincount(i)[i] >= min_item)
+        if keep.all():
+            log.info(f'  k-core сошёлся за {it} итераций')
+            return df
+        df = df[keep].reset_index(drop=True)
+        log.info(f'  итерация {it:2d}: строк {len(df):>11,} | пользователей {df["user_id"].nunique():>9,} | '
+                 f'товаров {df["parent_asin"].nunique():>8,}')
+    raise RuntimeError(f'k-core не сошёлся за {max_iter} итераций')
+
+
+def filter_rare(df: pd.DataFrame, step: 'StepLogger') -> pd.DataFrame:
+    """Шаги 4–5: фильтр товаров и пользователей способом FILTER."""
+    if FILTER == 'global':
+        df = keep_frequent(df, 'parent_asin', MIN_ITEM_INTERACTIONS)
+        step(f'3. товары с ≥ {MIN_ITEM_INTERACTIONS} взаимодействиями', df)
+        df = keep_frequent(df, 'user_id', MIN_USER_INTERACTIONS)
+        step(f'4. пользователи с ≥ {MIN_USER_INTERACTIONS} взаимодействиями', df)
+    elif FILTER == 'k_core':
+        df = k_core(df, MIN_USER_INTERACTIONS, MIN_ITEM_INTERACTIONS)
+        step(f'3–4. k-core: пользователи ≥ {MIN_USER_INTERACTIONS}, товары ≥ {MIN_ITEM_INTERACTIONS}', df)
+    else:
+        raise ValueError(f"FILTER должен быть 'global' или 'k_core', получено {FILTER!r}")
+    return df
+
+
 def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     step = StepLogger()
     step('0. исходные отзывы', df)
@@ -190,30 +233,58 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     df = df[df['rating'] > RATING_THRESHOLD].reset_index(drop=True)
     step(f'2. rating > {RATING_THRESHOLD:g}', df)
 
-    df = keep_frequent(df, 'parent_asin', MIN_ITEM_INTERACTIONS)
-    step(f'3. товары с ≥ {MIN_ITEM_INTERACTIONS} взаимодействиями', df)
+    df = filter_rare(df, step)
 
-    df = keep_frequent(df, 'user_id', MIN_USER_INTERACTIONS)
-    step(f'4. пользователи с ≥ {MIN_USER_INTERACTIONS} взаимодействиями', df)
-
-    from_end = df.groupby('user_id', observed=True).cumcount(ascending=False)
-    df = df[from_end < MAX_SEQ_LEN].reset_index(drop=True)
-    step(f'5. последние {MAX_SEQ_LEN} взаимодействий пользователя', df)
+    if MAX_SEQ_LEN is not None:
+        from_end = df.groupby('user_id', observed=True).cumcount(ascending=False)
+        df = df[from_end < MAX_SEQ_LEN].reset_index(drop=True)
+        step(f'5. последние {MAX_SEQ_LEN} взаимодействий пользователя', df)
 
     df = df[['user_id', 'parent_asin', 'timestamp']]
     for c in ('user_id', 'parent_asin'):
         df[c] = df[c].cat.remove_unused_categories()
 
-    # Порог по товарам считался по всем данным, поэтому в итоговых часть товаров реже него
-    item_cnt = df['parent_asin'].value_counts()
-    lens = df.groupby('user_id', observed=True).size()
-    log.info(f'Длина последовательности: min {lens.min()}, медиана {lens.median():g}, '
-             f'среднее {lens.mean():.2f}, max {lens.max()}; '
-             f'доля пользователей с длиной {MAX_SEQ_LEN}: {(lens == MAX_SEQ_LEN).mean():.1%}')
-    log.info(f'Взаимодействий на товар: медиана {item_cnt.median():g}, среднее {item_cnt.mean():.2f}; '
-             f'реже {MIN_ITEM_INTERACTIONS}: {(item_cnt < MIN_ITEM_INTERACTIONS).mean():.1%} товаров, '
-             f'ровно 1: {(item_cnt == 1).mean():.1%}')
     return df
+
+
+def _quantiles(counts: pd.Series) -> str:
+    q = counts.quantile([.25, .5, .75, .9])
+    return (f'min {counts.min()}, q25 {q[.25]:g}, медиана {q[.5]:g}, q75 {q[.75]:g}, '
+            f'q90 {q[.9]:g}, max {counts.max()}, среднее {counts.mean():.2f}')
+
+
+def _top_share(counts: pd.Series, frac: float) -> float:
+    """Доля взаимодействий, приходящаяся на top-frac самых популярных товаров."""
+    k = max(1, int(round(frac * counts.size)))
+    return counts.nlargest(k).sum() / counts.sum()
+
+
+def log_dataset_summary(df: pd.DataFrame) -> None:
+    """
+    Итоговая сводка: размеры (как в Table 1 статей), распределения длин и популярности,
+    перекос по товарам. Средние без квантилей прячут форму распределения, поэтому и то, и другое.
+    """
+    lens = df.groupby('user_id', observed=True).size()
+    item_cnt = df['parent_asin'].value_counts()
+    users, items, n = lens.size, item_cnt.size, len(df)
+
+    log.info('--- Итог ---')
+    log.info(f'Пользователей:  {users:>12,}')
+    log.info(f'Товаров:        {items:>12,}')
+    log.info(f'Взаимодействий: {n:>12,}')
+    log.info(f'Средняя длина последовательности: {n / users:.2f}')
+    log.info(f'Взаимодействий на товар в среднем: {n / items:.2f}')
+    log.info(f'Разреженность: {1 - n / (users * items):.6%}')
+
+    tail = (f'; упираются в MAX_SEQ_LEN={MAX_SEQ_LEN}: {(lens == MAX_SEQ_LEN).mean():.1%}'
+            if MAX_SEQ_LEN is not None else f'; с длиной ≥ 20: {(lens >= 20).mean():.1%}')
+    log.info(f'Длина последовательности: {_quantiles(lens)}{tail}')
+    log.info(f'Популярность товара: {_quantiles(item_cnt)}; '
+             f'реже порога {MIN_ITEM_INTERACTIONS}: {(item_cnt < MIN_ITEM_INTERACTIONS).mean():.1%}, '
+             f'ровно 1: {(item_cnt == 1).mean():.1%}')
+    log.info(f'Перекос: на top-1% товаров приходится {_top_share(item_cnt, 0.01):.1%} взаимодействий, '
+             f'на top-20% — {_top_share(item_cnt, 0.20):.1%} '
+             f'(равномерно было бы 1% и 20%)')
 
 
 def item_texts(df: pd.DataFrame) -> pd.DataFrame:
@@ -230,8 +301,8 @@ def item_texts(df: pd.DataFrame) -> pd.DataFrame:
 
 def build_sequences(df: pd.DataFrame, items: pd.Series) -> pd.DataFrame:
     """
-    Последовательности пользователей в формате data/ATG (без столбца next и без сплита).
-    items — parent_asin в порядке items.parquet: позиция = id товара, id паддинга = len(items).
+    Полные последовательности пользователей: seq — список id товаров по времени, без обрезки
+    и паддинга. items — parent_asin в порядке items.parquet: позиция = id товара.
     """
     item_num = len(items)
     item_id = pd.Series(np.arange(item_num), index=items.to_numpy())
@@ -244,13 +315,13 @@ def build_sequences(df: pd.DataFrame, items: pd.Series) -> pd.DataFrame:
     seqs = pd.Series(ids.astype(np.int64)).groupby(df['user_id'].astype(str).to_numpy()).agg(list)
     table = pd.DataFrame({
         'user_id': seqs.index.to_numpy(),
-        'seq':     [[item_num] * (MAX_SEQ_LEN - len(s)) + s for s in seqs],
+        'seq':     seqs.to_numpy(),
         'len_seq': seqs.map(len).to_numpy(),
     })
 
     seen = np.unique(np.concatenate(table['seq'].to_numpy()))
     log.info(f'Последовательности: пользователей {len(table):,} | взаимодействий {table["len_seq"].sum():,} | '
-             f'товаров {(seen < item_num).sum():,} из {item_num:,} | len_seq: min {table["len_seq"].min()}, '
+             f'товаров {seen.size:,} из {item_num:,} | len_seq: min {table["len_seq"].min()}, '
              f'медиана {table["len_seq"].median():g}, max {table["len_seq"].max()}')
     return table
 
@@ -258,19 +329,14 @@ def build_sequences(df: pd.DataFrame, items: pd.Series) -> pd.DataFrame:
 SPLIT_COLUMNS = ['user_id', 'seq', 'len_seq', 'next']
 
 
-def _example(user: str, history: list[int], target: int, seq_size: int, pad: int) -> tuple:
-    """Один пример: история обрезается до последних seq_size товаров и паддится слева."""
-    h = history[-seq_size:]
-    return user, [pad] * (seq_size - len(h)) + h, len(h), target
+def _example(user: str, history: list[int], target: int) -> tuple:
+    """Один пример: история целиком (без обрезки и паддинга) и таргет."""
+    return user, list(history), len(history), target
 
 
-def build_splits(sequences: pd.DataFrame, item_num: int) -> dict[str, pd.DataFrame]:
-    """
-    Сплит полных последовательностей (sequences.df) в формате data/ATG, способ — SPLIT.
-    seq_size = MAX_SEQ_LEN − 1: один из MAX_SEQ_LEN товаров пользователя всегда уходит в next.
-    """
-    seq_size, pad = MAX_SEQ_LEN - 1, item_num
-    full = [list(s[MAX_SEQ_LEN - n:]) for s, n in zip(sequences['seq'], sequences['len_seq'])]
+def build_splits(sequences: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Сплит полных последовательностей (sequences.df), способ — SPLIT."""
+    full = [list(s) for s in sequences['seq']]
     users = sequences['user_id'].tolist()
 
     if SPLIT == 'leave_one_out':
@@ -282,14 +348,14 @@ def build_splits(sequences: pd.DataFrame, item_num: int) -> dict[str, pd.DataFra
         rows = {'train': [], 'val': [], 'test': []}
         for user, items in zip(users, full):
             n = len(items)
-            rows['test'].append(_example(user, items[:n - 1], items[n - 1], seq_size, pad))
-            rows['val'].append(_example(user, items[:n - 2], items[n - 2], seq_size, pad))
-            targets = range(1, n - 2) if TRAIN_PREFIXES else [n - 3]
+            rows['test'].append(_example(user, items[:n - 1], items[n - 1]))
+            rows['val'].append(_example(user, items[:n - 2], items[n - 2]))
+            targets = range(1, n - 2) if PREFIXES_SEPARATELY else [n - 3]
             for t in targets:
-                rows['train'].append(_example(user, items[:t], items[t], seq_size, pad))
+                rows['train'].append(_example(user, items[:t], items[t]))
         splits = {name: pd.DataFrame(r, columns=SPLIT_COLUMNS) for name, r in rows.items()}
     elif SPLIT == 'users':
-        table = pd.DataFrame([_example(u, items[:-1], items[-1], seq_size, pad)
+        table = pd.DataFrame([_example(u, items[:-1], items[-1])
                               for u, items in zip(users, full)], columns=SPLIT_COLUMNS)
         perm = np.random.default_rng(SPLIT_SEED).permutation(len(table))
         bounds = np.cumsum([0] + [round(f * len(table)) for f in SPLIT_FRACTIONS.values()])
@@ -301,7 +367,6 @@ def build_splits(sequences: pd.DataFrame, item_num: int) -> dict[str, pd.DataFra
 
     train_items = set(np.concatenate(splits['train']['seq'].to_numpy()).tolist())
     train_items |= set(splits['train']['next'].tolist())
-    train_items.discard(pad)
     for name, s in splits.items():
         log.info(f'Сплит {name:5s}: примеров {len(s):>9,} | пользователей {s["user_id"].nunique():>8,} | '
                  f'таргетов-товаров {s["next"].nunique():>8,} | len_seq: min {s["len_seq"].min()}, '
@@ -326,15 +391,15 @@ def main() -> None:
     )
     log.info(f'DEDUP_SUBSET={DEDUP_SUBSET}, RATING_THRESHOLD={RATING_THRESHOLD}, '
              f'MIN_USER_INTERACTIONS={MIN_USER_INTERACTIONS}, MIN_ITEM_INTERACTIONS={MIN_ITEM_INTERACTIONS}, '
-             f'MAX_SEQ_LEN={MAX_SEQ_LEN}, SPLIT={SPLIT!r}'
-             + (f', TRAIN_PREFIXES={TRAIN_PREFIXES}' if SPLIT == 'leave_one_out'
+             f'MAX_SEQ_LEN={MAX_SEQ_LEN}, FILTER={FILTER!r}, SPLIT={SPLIT!r}'
+             + (f', PREFIXES_SEPARATELY={PREFIXES_SEPARATELY}' if SPLIT == 'leave_one_out'
                 else f', SPLIT_FRACTIONS={SPLIT_FRACTIONS}, SPLIT_SEED={SPLIT_SEED}'))
     log.info(f'TEXT={TEXT}')
 
     df = preprocess(load_reviews())
     texts = item_texts(df)
     sequences = build_sequences(df, texts['parent_asin'])
-    splits = build_splits(sequences, len(texts))
+    splits = build_splits(sequences)
 
     out = OUT_DIR / 'interactions.parquet'
     pq.write_table(pa.Table.from_pandas(df.astype({'user_id': str, 'parent_asin': str}),
@@ -348,10 +413,13 @@ def main() -> None:
     sequences.to_pickle(OUT_DIR / 'sequences.df')
     for name, split in splits.items():
         split.to_pickle(OUT_DIR / f'{name}_data.df')
-    seq_size = MAX_SEQ_LEN - 1
+    # seq_size — самая длинная история в сплитах: справочно, окно модели задаётся её конфигом
+    seq_size = max(int(s['len_seq'].max()) for s in splits.values())
     pd.DataFrame({'seq_size': [seq_size], 'item_num': [len(texts)]}).to_pickle(OUT_DIR / 'data_statis.df')
     log.info(f'Сохранено: sequences.df, {", ".join(f"{n}_data.df" for n in splits)}, '
              f'data_statis.df (seq_size {seq_size}, item_num {len(texts):,})')
+
+    log_dataset_summary(df)
 
 
 if __name__ == '__main__':

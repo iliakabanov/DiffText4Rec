@@ -40,5 +40,5 @@ eval:
   top_k: [10, 20]
 
 output:
-  dir: ./checkpoints
+  dir: ./checkpoints/atg
   run_name: sasrec_alphafuse

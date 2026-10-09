@@ -41,6 +41,6 @@ eval:
   num_sample_steps: 50  # сетка AlphaFuse 0, 100, …, 2000; у нас ancestral DDPM вместо DDIM
 
 output:
-  dir: ./checkpoints
+  dir: ./checkpoints/atg
   run_name: dreamrec_alphafuse_3
 

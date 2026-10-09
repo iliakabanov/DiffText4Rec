@@ -54,6 +54,9 @@ class GenerativeRecommender(nn.Module):
         p_uncond:         вероятность CFG dropout (h → null_token) на обучении.
         w_cfg:            сила classifier-free guidance на инференсе (0 — без guidance).
         retrieval_metric: 'cosine', 'dot' или 'l2'.
+        train_prefixes:   True — лосс на каждом префиксе истории за один проход энкодера
+                          (каждая позиция предсказывает следующий товар), False — только
+                          последняя позиция → target.
     """
 
     def __init__(
@@ -65,6 +68,7 @@ class GenerativeRecommender(nn.Module):
         p_uncond: float,
         w_cfg: float,
         retrieval_metric: str,
+        train_prefixes: bool = False,
     ):
         super().__init__()
         if retrieval_metric not in RETRIEVAL_METRICS:
@@ -76,6 +80,7 @@ class GenerativeRecommender(nn.Module):
         self.p_uncond = p_uncond
         self.w_cfg    = w_cfg
         self.retrieval_metric = retrieval_metric
+        self.train_prefixes   = train_prefixes
 
     @property
     def d_emb(self) -> int:
@@ -91,8 +96,21 @@ class GenerativeRecommender(nn.Module):
 
     def compute_loss(self, history: torch.LongTensor, target: torch.LongTensor,
                      mask: torch.FloatTensor) -> torch.Tensor:
-        h = self.denoiser.drop_condition(self.encode_history(history, mask), self.p_uncond)
-        return self.process.loss(self.denoiser, self.items(target), h)
+        """
+        train_prefixes=False — один пример на строку: h последней позиции → target.
+        train_prefixes=True  — каждая позиция истории предсказывает следующий товар (последняя —
+        target) за один проход энкодера. Процессу (DDPM, FlowMatching) всё равно, сколько строк:
+        шаг диффузии и шум он сэмплирует на каждую строку отдельно.
+        """
+        if not self.train_prefixes:
+            h = self.denoiser.drop_condition(self.encode_history(history, mask), self.p_uncond)
+            return self.process.loss(self.denoiser, self.items(target), h)
+
+        labels = torch.cat([history[:, 1:], target[:, None]], dim=1)   # следующий товар для позиции
+        valid = mask > 0                                               # padding слева: i реальна → i+1 тоже
+        h = self.encoder.encode(self.items(history), mask)[valid]      # (N, d_emb)
+        h = self.denoiser.drop_condition(h, self.p_uncond)             # CFG dropout — на каждый префикс
+        return self.process.loss(self.denoiser, self.items(labels[valid]), h)
 
     @torch.no_grad()
     def sample(self, h: torch.Tensor, num_steps: int | None = None,
@@ -119,6 +137,7 @@ class GenerativeRecommender(nn.Module):
             'p_uncond': self.p_uncond,
             'w_cfg': self.w_cfg,
             'retrieval_metric': self.retrieval_metric,
+            'train_prefixes': self.train_prefixes,
         }
 
     def param_summary(self) -> dict:
@@ -136,13 +155,15 @@ class DreamRec(GenerativeRecommender):
 
     def __init__(self, *, n_items: int, padding_idx: int, d_emb: int, n_heads: int, d_ff: int,
                  dropout: float, max_seq_len: int, T: int, beta_schedule: str,
-                 p_uncond: float, w_cfg: float, retrieval_metric: str):
+                 p_uncond: float, w_cfg: float, retrieval_metric: str,
+                 train_prefixes: bool = False):
         super().__init__(
             items=ItemEmbedding.learned(n_items, d_emb, padding_idx),
             encoder=HistoryEncoder(d_emb, n_heads, d_ff, dropout, max_seq_len),
             denoiser=ConcatDenoiser(d_emb),
             process=DDPM(T, beta_schedule),
             p_uncond=p_uncond, w_cfg=w_cfg, retrieval_metric=retrieval_metric,
+            train_prefixes=train_prefixes,
         )
 
 
@@ -152,7 +173,8 @@ class DreamRecText(GenerativeRecommender):
     def __init__(self, *, item_embeddings_raw: np.ndarray, padding_idx: int, use_pca: bool,
                  n_components: int, per_component_whitening: bool, whitening_cache: str | Path,
                  n_heads: int, d_ff: int, dropout: float, max_seq_len: int,
-                 T: int, beta_schedule: str, p_uncond: float, w_cfg: float, retrieval_metric: str):
+                 T: int, beta_schedule: str, p_uncond: float, w_cfg: float, retrieval_metric: str,
+                 train_prefixes: bool = False):
         items = ItemEmbedding.text(item_embeddings_raw, padding_idx, use_pca, n_components,
                                    per_component_whitening, whitening_cache)
         super().__init__(
@@ -161,6 +183,7 @@ class DreamRecText(GenerativeRecommender):
             denoiser=ConcatDenoiser(items.d_emb),
             process=DDPM(T, beta_schedule),
             p_uncond=p_uncond, w_cfg=w_cfg, retrieval_metric=retrieval_metric,
+            train_prefixes=train_prefixes,
         )
 
 
@@ -170,7 +193,8 @@ class DreamRecFMText(GenerativeRecommender):
     def __init__(self, *, item_embeddings_raw: np.ndarray, padding_idx: int, use_pca: bool,
                  n_components: int, per_component_whitening: bool, whitening_cache: str | Path,
                  n_heads: int, d_ff: int, dropout: float, max_seq_len: int, prediction: str,
-                 p_uncond: float, w_cfg: float, retrieval_metric: str):
+                 p_uncond: float, w_cfg: float, retrieval_metric: str,
+                 train_prefixes: bool = False):
         items = ItemEmbedding.text(item_embeddings_raw, padding_idx, use_pca, n_components,
                                    per_component_whitening, whitening_cache)
         super().__init__(
@@ -179,6 +203,7 @@ class DreamRecFMText(GenerativeRecommender):
             denoiser=ConcatDenoiser(items.d_emb),
             process=FlowMatching(prediction),
             p_uncond=p_uncond, w_cfg=w_cfg, retrieval_metric=retrieval_metric,
+            train_prefixes=train_prefixes,
         )
 
 
@@ -189,7 +214,7 @@ class DreamRecAlphaFuse(GenerativeRecommender):
                  null_dim: int | None, null_thres: float | None, fusion: str, id_init: str,
                  whitening_cache: str | Path, n_heads: int, d_ff: int, dropout: float,
                  max_seq_len: int, T: int, beta_schedule: str, p_uncond: float, w_cfg: float,
-                 retrieval_metric: str):
+                 retrieval_metric: str, train_prefixes: bool = False):
         super().__init__(
             items=AlphaFuseItemEmbedding(item_embeddings_raw, padding_idx, d_emb, null_dim,
                                          null_thres, fusion, id_init, whitening_cache),
@@ -197,6 +222,7 @@ class DreamRecAlphaFuse(GenerativeRecommender):
             denoiser=ConcatDenoiser(d_emb),
             process=DDPM(T, beta_schedule),
             p_uncond=p_uncond, w_cfg=w_cfg, retrieval_metric=retrieval_metric,
+            train_prefixes=train_prefixes,
         )
 
 
@@ -269,6 +295,25 @@ if __name__ == '__main__':
                 else:
                     assert grad_items is None
             assert model.encoder.block.parameters().__next__().grad is not None
+
+            # Лосс на префиксах: конечен, даёт градиенты, и при истории из одного товара
+            # совпадает с обычным (позиция ровно одна; шум фиксируем сидом)
+            model.zero_grad(set_to_none=True)
+            model.train_prefixes = True
+            loss_pref = model.compute_loss(history, target, mask)
+            loss_pref.backward()
+            assert torch.isfinite(loss_pref) and model.denoiser.linear.weight.grad is not None
+            one = torch.full((B, L), PADDING_IDX := N_ITEMS, dtype=torch.long, device=device)
+            one[:, -1] = history[:, -1]
+            m_one = torch.zeros(B, L, device=device); m_one[:, -1] = 1.0
+            model.eval()
+            with torch.no_grad():
+                torch.manual_seed(1); a = model.compute_loss(one, target, m_one)
+                model.train_prefixes = False
+                torch.manual_seed(1); b = model.compute_loss(one, target, m_one)
+            assert torch.allclose(a, b, atol=1e-5), (name, a.item(), b.item())
+            model.train()
+
             model.eval()
             for metric in RETRIEVAL_METRICS:
                 model.retrieval_metric = metric

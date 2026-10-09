@@ -19,7 +19,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from models.sasrec import SASRecBlock
+from models.sasrec import SASRecBlock, causal_attn_mask
 from whitening import apply_whitening, load_or_compute_whitening
 
 TIME_STEPS = 1000
@@ -217,30 +217,36 @@ class HistoryEncoder(nn.Module):
     История → conditioning-вектор h ∈ d_emb: эмбеддинги товаров + позиционные,
     один каузальный SASRec-блок (pre-norm), LayerNorm, выход последней позиции
     (padding слева, поэтому последняя позиция — всегда последний реальный товар).
+
+    encode() отдаёт все позиции: attention каузальный, поэтому позиция i — это conditioning
+    для префикса истории до i-го товара включительно (нужно для обучения на префиксах).
     """
 
     def __init__(self, d_emb: int, n_heads: int, d_ff: int, dropout: float, max_seq_len: int):
         super().__init__()
+        self.n_heads       = n_heads
         self.pos_embedding = nn.Embedding(max_seq_len, d_emb)
         self.dropout       = nn.Dropout(dropout)
         self.block         = SASRecBlock(d_emb, n_heads, d_ff, dropout)
         self.norm          = nn.LayerNorm(d_emb)
         nn.init.zeros_(self.pos_embedding.weight)
 
-    def forward(self, seq_emb: torch.Tensor, mask: torch.FloatTensor) -> torch.Tensor:
+    def encode(self, seq_emb: torch.Tensor, mask: torch.FloatTensor) -> torch.Tensor:
         """
         Args:
             seq_emb: (B, L, d_emb) — эмбеддинги товаров истории.
             mask:    (B, L) — 1 для реальных товаров, 0 для padding.
 
         Returns:
-            h: (B, d_emb)
+            (B, L, d_emb) — conditioning для каждого префикса истории.
         """
         L = seq_emb.shape[1]
         x = self.dropout(seq_emb + self.pos_embedding(torch.arange(L, device=seq_emb.device)))
-        causal = torch.triu(torch.ones(L, L, dtype=torch.bool, device=seq_emb.device), diagonal=1)
-        x = self.norm(self.block(x, attn_mask=causal, key_padding_mask=(mask == 0)))
-        return torch.nan_to_num(x, nan=0.0)[:, -1]   # пустая история даёт NaN в attention
+        return self.norm(self.block(x, attn_mask=causal_attn_mask(mask, self.n_heads)))
+
+    def forward(self, seq_emb: torch.Tensor, mask: torch.FloatTensor) -> torch.Tensor:
+        """История → h (B, d_emb): conditioning последней позиции."""
+        return self.encode(seq_emb, mask)[:, -1]
 
 
 # --------------------------------------------------------------------------- #

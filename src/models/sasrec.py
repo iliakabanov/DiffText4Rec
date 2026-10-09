@@ -51,28 +51,41 @@ class SASRecBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        attn_mask: torch.Tensor,
-        key_padding_mask: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x:                (B, L, d_model)
-            attn_mask:        (L, L) bool — True = запрещённая пара (каузальный)
-            key_padding_mask: (B, L) bool — True = игнорировать ключ (padding)
+            x:         (B, L, d_model)
+            attn_mask: (B · n_heads, L, L) bool — True = запрещённая пара; строится
+                       causal_attn_mask() и уже включает каузальность и padding.
         """
         h = self.norm1(x)
-        h, _ = self.attn(
-            h, h, h,
-            attn_mask=attn_mask,
-            key_padding_mask=key_padding_mask,
-            need_weights=False,
-        )
+        h, _ = self.attn(h, h, h, attn_mask=attn_mask, need_weights=False)
         x = x + h
         x = x + self.ff(self.norm2(x))
         return x
+
+
+def causal_attn_mask(mask: torch.FloatTensor, n_heads: int) -> torch.Tensor:
+    """
+    Маска self-attention (B · n_heads, L, L), True = запрещено: позиция видит только не-padding
+    позиции слева от себя (включая себя).
+
+    Диагональ разрешена всегда — иначе у запроса на padding-позиции запрещены все ключи, softmax
+    берётся по строке из -inf и даёт NaN. С одним блоком такой NaN сидит на padding-позициях
+    (их всё равно не читают), но со второго блока он расползается через values на реальные
+    позиции: вес запрещённого ключа равен нулю, а 0 · NaN = NaN. Padding-позиции при этом
+    смотрят только на себя и в реальные позиции не попадают: их ключи запрещены.
+
+    Args:
+        mask:    (B, L) — 1.0 реальные позиции, 0.0 padding (padding слева).
+        n_heads: число голов; MHA ждёт маску, повторённую на каждую голову.
+    """
+    B, L = mask.shape
+    device = mask.device
+    causal = torch.triu(torch.ones(L, L, dtype=torch.bool, device=device), diagonal=1)
+    blocked = causal[None] | (mask == 0)[:, None, :]              # (B, L, L)
+    blocked &= ~torch.eye(L, dtype=torch.bool, device=device)     # диагональ всегда разрешена
+    return blocked.repeat_interleave(n_heads, dim=0)              # (B · n_heads, L, L)
 
 
 # --------------------------------------------------------------------------- #
@@ -95,6 +108,9 @@ class SASRec(nn.Module):
         tie_weights: использовать ли item_embedding как output projection.
         loss:        'ce' — full-softmax cross-entropy;
                      'infonce' — контрастивный InfoNCE с neg_ratio негативами.
+        train_prefixes: True — лосс на каждой позиции последовательности (каждая позиция
+                     предсказывает следующий товар) за один forward, как в оригинальном SASRec;
+                     False — только последняя позиция → next.
         neg_ratio:   число случайных негативов на один позитив (только для 'infonce').
         temperature: температура InfoNCE (только для 'infonce').
         retrieval_metric: ранжирование в recommend(): 'cosine' — косинус h и эмбеддингов товаров;
@@ -120,6 +136,7 @@ class SASRec(nn.Module):
         neg_ratio: int = 64,
         temperature: float = 0.07,
         retrieval_metric: str = 'cosine',
+        train_prefixes: bool = False,
         items: nn.Module | None = None,
     ):
         super().__init__()
@@ -142,6 +159,7 @@ class SASRec(nn.Module):
         self.neg_ratio   = neg_ratio
         self.temperature = temperature
         self.retrieval_metric = retrieval_metric
+        self.train_prefixes   = train_prefixes
 
         # Эмбеддинги товаров: внешний модуль или своя обучаемая таблица.
         # padding_idx обнуляет вектор и запрещает градиент через него.
@@ -194,7 +212,7 @@ class SASRec(nn.Module):
     # Forward
     # ------------------------------------------------------------------ #
 
-    def forward(
+    def encode(
         self,
         history: torch.LongTensor,
         mask: torch.FloatTensor,
@@ -205,9 +223,10 @@ class SASRec(nn.Module):
             mask:    (B, L) — 1.0 реальные позиции, 0.0 padding.
 
         Returns:
-            h: (B, d_model) — представление пользователя из последней позиции.
+            (B, L, d_model) — представление после каждой позиции. Attention каузальный, поэтому
+            позиция i видит только товары ≤ i, то есть это представления всех префиксов истории.
         """
-        B, L = history.shape
+        L = history.shape[1]
         device = history.device
 
         # Embeddings
@@ -216,26 +235,22 @@ class SASRec(nn.Module):
         x = x + self.pos_embedding(positions)                           # (B, L, d_model)
         x = self.dropout_emb(x)
 
-        # Каузальная маска: позиция i не может смотреть вперёд (j > i).
-        # PyTorch MHA: True → добавляет -inf к logit → атентион обнуляется.
-        causal_mask = torch.triu(
-            torch.ones(L, L, device=device, dtype=torch.bool), diagonal=1
-        )                                                                 # (L, L)
-
-        # Ключи на padding-позициях игнорируются.
-        key_padding_mask = (mask == 0)                                   # (B, L)
-
+        # Каузальность + padding одной маской; диагональ разрешена, поэтому NaN не возникает
+        attn_mask = causal_attn_mask(mask, self.n_heads)                  # (B · n_heads, L, L)
         for block in self.blocks:
-            x = block(x, attn_mask=causal_mask, key_padding_mask=key_padding_mask)
+            x = block(x, attn_mask=attn_mask)
 
         x = self.final_norm(x)
+        # Реальные позиции считаются корректно; padding-позиции смотрят только на себя, их не читают
+        return x                                                          # (B, L, d_model)
 
-        # Padding query-позиции могут дать NaN (softmax над всеми -inf),
-        # но мы читаем только последнюю позицию, которая всегда реальна.
-        # nan_to_num — защита от распространения NaN через residual connection.
-        x = torch.nan_to_num(x, nan=0.0)
-
-        return x[:, -1, :]                                               # (B, d_model)
+    def forward(
+        self,
+        history: torch.LongTensor,
+        mask: torch.FloatTensor,
+    ) -> torch.Tensor:
+        """История → представление пользователя (B, d_model) из последней позиции."""
+        return self.encode(history, mask)[:, -1, :]
 
     # ------------------------------------------------------------------ #
     # Loss
@@ -251,8 +266,23 @@ class SASRec(nn.Module):
         Loss в зависимости от self.loss:
           'ce'      — full-softmax cross-entropy по всем n_items.
           'infonce' — контрастивный InfoNCE с self.neg_ratio негативами.
+
+        train_prefixes=False — один таргет на строку: представление последней позиции → next.
+        train_prefixes=True  — позиционный лосс, как в оригинальном SASRec: за один forward
+        каждая позиция i предсказывает товар i+1 (последняя — next). Даёт столько же обучающих
+        сигналов, сколько разворачивание префиксов в отдельные строки, но без лишних forward.
         """
-        h = self.forward(history, mask)                                  # (B, d_model)
+        if not self.train_prefixes:
+            h = self.forward(history, mask)                              # (B, d_model)
+            return self._loss(h, target)
+
+        # Таргет позиции i — следующий товар истории, у последней позиции — next
+        labels = torch.cat([history[:, 1:], target[:, None]], dim=1)     # (B, L)
+        valid = mask > 0                                                 # padding слева: i реальна → i+1 тоже
+        h = self.encode(history, mask)[valid]                            # (N, d_model), N = число реальных позиций
+        return self._loss(h, labels[valid])
+
+    def _loss(self, h: torch.Tensor, target: torch.LongTensor) -> torch.Tensor:
         if self.loss == 'infonce':
             return self._infonce_loss(h, target)
         return F.cross_entropy(self._logits(h), target)
@@ -366,6 +396,7 @@ class SASRec(nn.Module):
             'neg_ratio': self.neg_ratio,
             'temperature': self.temperature,
             'retrieval_metric': self.retrieval_metric,
+            'train_prefixes': self.train_prefixes,
             **(self.items.info if self.items is not None else {}),
         }
 
@@ -385,7 +416,7 @@ class SASRecAlphaFuse(SASRec):
                  null_dim: int | None, null_thres: float | None, fusion: str, id_init: str,
                  whitening_cache, n_heads: int, n_layers: int, d_ff: int, dropout: float,
                  max_seq_len: int, loss: str, neg_ratio: int, temperature: float,
-                 retrieval_metric: str):
+                 retrieval_metric: str, train_prefixes: bool = False):
         # Импорт здесь: models.components сам импортирует SASRecBlock из этого модуля
         from models.components import AlphaFuseItemEmbedding
 
@@ -395,7 +426,7 @@ class SASRecAlphaFuse(SASRec):
             n_items=items.n_items, padding_idx=padding_idx, d_model=d_model, n_heads=n_heads,
             n_layers=n_layers, d_ff=d_ff, dropout=dropout, max_seq_len=max_seq_len,
             tie_weights=True, loss=loss, neg_ratio=neg_ratio, temperature=temperature,
-            retrieval_metric=retrieval_metric, items=items,
+            retrieval_metric=retrieval_metric, train_prefixes=train_prefixes, items=items,
         )
 
 
@@ -456,6 +487,50 @@ if __name__ == '__main__':
     # Test 4: рекомендации не включают padding_idx
     assert (recs != PADDING_IDX).all(), 'Padding idx should not appear in recommendations'
     print(f'No padding in recommendations  OK')
+
+    # Test 4b: позиционный лосс — тот же набор пар «префикс → следующий товар» за один forward
+    model.train_prefixes = True
+    loss_pref = model.compute_loss(history, target, mask)
+    model.train_prefixes = False
+    assert torch.isfinite(loss_pref)
+    with torch.no_grad():                       # при истории из одного товара позиция одна → лоссы равны
+        one = torch.zeros(B, L, dtype=torch.long, device=device) + PADDING_IDX
+        one[:, -1] = history[:, -1]
+        m_one = torch.zeros(B, L, device=device); m_one[:, -1] = 1.0
+        model.eval()
+        model.loss = 'ce'                       # у infonce негативы случайны, лоссы не сравнить
+        a = model.compute_loss(one, target, m_one)
+        model.train_prefixes = True
+        b = model.compute_loss(one, target, m_one)
+        model.train_prefixes = False
+        model.loss = 'infonce'
+        model.train()
+        assert torch.allclose(a, b, atol=1e-5), (a.item(), b.item())
+    print(f'Позиционный лосс: {loss_pref.item():.4f} (последняя позиция {loss.item():.4f})  OK')
+
+    # Test 4c: при любом числе слоёв представление живое и разное у разных историй.
+    # Раньше со второго блока NaN с padding-позиций расползался на реальные, h обнулялся
+    # и все пользователи получали одинаковые рекомендации.
+    for n_layers in (1, 2, 3):
+        deep = SASRec(n_items=N_ITEMS, padding_idx=PADDING_IDX, d_model=32, n_heads=2,
+                      n_layers=n_layers, d_ff=64, dropout=0.0, max_seq_len=L).to(device).eval()
+        with torch.no_grad():
+            h_deep = deep(history, mask)
+            recs_deep = deep.recommend(history, mask, top_k=5)
+        assert torch.isfinite(h_deep).all(), f'n_layers={n_layers}: NaN или inf в представлении'
+        assert h_deep.norm(dim=-1).min() > 1e-6, f'n_layers={n_layers}: нулевое представление'
+        assert not torch.equal(recs_deep[0], recs_deep[1]), \
+            f'n_layers={n_layers}: одинаковые рекомендации у разных историй'
+        # Паддинг не влияет на результат: та же история в окне большей длины
+        wide = torch.full((B, L * 2), PADDING_IDX, dtype=torch.long, device=device)
+        wide[:, L:] = history
+        wide_mask = torch.zeros(B, L * 2, device=device); wide_mask[:, L:] = mask
+        deep.pos_embedding = nn.Embedding(L * 2, 32).to(device)      # позиции считаются от начала окна
+        nn.init.zeros_(deep.pos_embedding.weight)
+        with torch.no_grad():
+            assert torch.allclose(deep(history, mask), deep(wide, wide_mask), atol=1e-5), \
+                f'n_layers={n_layers}: лишний паддинг меняет представление'
+    print('Глубина 1–3 слоя: представление живое, паддинг не влияет  OK')
 
     # Test 5: градиент идёт через compute_loss
     loss2 = model.compute_loss(history, target, mask)

@@ -43,6 +43,7 @@ class SASRecModelConfig:
     neg_ratio:   int
     temperature: float
     retrieval_metric: str         # cosine, dot
+    train_prefixes: bool = False  # true — лосс на каждой позиции (оригинальный SASRec) за один forward
 
 
 @dataclass
@@ -66,6 +67,7 @@ def build_sasrec(cfg: SASRecConfig) -> SASRec:
         neg_ratio=m.neg_ratio,
         temperature=m.temperature,
         retrieval_metric=m.retrieval_metric,
+        train_prefixes=m.train_prefixes,
     )
 
 
@@ -88,6 +90,7 @@ class SASRecAlphaFuseModelConfig:
     neg_ratio:   int
     temperature: float
     retrieval_metric: str         # cosine, dot
+    train_prefixes: bool = False  # true — лосс на каждой позиции (оригинальный SASRec) за один forward
 
 
 @dataclass
@@ -118,6 +121,7 @@ def build_sasrec_alphafuse(cfg: SASRecAlphaFuseConfig) -> SASRecAlphaFuse:
         neg_ratio=m.neg_ratio,
         temperature=m.temperature,
         retrieval_metric=m.retrieval_metric,
+        train_prefixes=m.train_prefixes,
     )
 
 
@@ -136,6 +140,7 @@ class DreamRecModelConfig:
     p_uncond:         float
     w_cfg:            float
     retrieval_metric: str      # cosine, dot, l2
+    train_prefixes:   bool = False   # true — лосс на каждом префиксе истории за один проход
 
 
 @dataclass
@@ -158,6 +163,7 @@ def build_dreamrec(cfg: DreamRecConfig) -> DreamRec:
         p_uncond=m.p_uncond,
         w_cfg=m.w_cfg,
         retrieval_metric=m.retrieval_metric,
+        train_prefixes=m.train_prefixes,
     )
 
 
@@ -178,6 +184,7 @@ class DreamRecTextModelConfig:
     p_uncond:                float
     w_cfg:                   float
     retrieval_metric:        str      # cosine, dot, l2
+    train_prefixes:          bool = False   # true — лосс на каждом префиксе истории за один проход
 
 
 @dataclass
@@ -206,6 +213,7 @@ def build_dreamrec_text(cfg: DreamRecTextConfig) -> DreamRecText:
         p_uncond=m.p_uncond,
         w_cfg=m.w_cfg,
         retrieval_metric=m.retrieval_metric,
+        train_prefixes=m.train_prefixes,
     )
 
 
@@ -225,6 +233,7 @@ class DreamRecFMTextModelConfig:
     p_uncond:                float
     w_cfg:                   float
     retrieval_metric:        str      # cosine, dot, l2
+    train_prefixes:          bool = False   # true — лосс на каждом префиксе истории за один проход
 
 
 @dataclass
@@ -252,6 +261,7 @@ def build_dreamrec_fm_text(cfg: DreamRecFMTextConfig) -> DreamRecFMText:
         p_uncond=m.p_uncond,
         w_cfg=m.w_cfg,
         retrieval_metric=m.retrieval_metric,
+        train_prefixes=m.train_prefixes,
     )
 
 
@@ -274,6 +284,7 @@ class DreamRecAlphaFuseModelConfig:
     p_uncond:         float
     w_cfg:            float
     retrieval_metric: str              # cosine, dot, l2
+    train_prefixes:   bool = False     # true — лосс на каждом префиксе истории за один проход
 
 
 @dataclass
@@ -304,6 +315,7 @@ def build_dreamrec_alphafuse(cfg: DreamRecAlphaFuseConfig) -> DreamRecAlphaFuse:
         p_uncond=m.p_uncond,
         w_cfg=m.w_cfg,
         retrieval_metric=m.retrieval_metric,
+        train_prefixes=m.train_prefixes,
     )
 
 

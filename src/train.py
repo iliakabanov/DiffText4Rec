@@ -1,8 +1,10 @@
 """
 Обучение любой модели из builders.MODELS — какой именно, сказано в yaml (model_type):
 
-    python src/training.py --config configs/dreamrec.yaml
-    python src/training.py --config configs/dreamrec_text.yaml
+    python src/train.py --config configs/toys/dreamrec.yaml
+    python src/train.py --config configs/atg/dreamrec_text.yaml
+
+Конфиги лежат по датасетам: configs/<dataset>/<модель>.yaml.
 
 От модели нужно:
     compute_loss(history, target, mask)               -> скаляр
@@ -36,6 +38,8 @@ os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
 import argparse
 import csv
+import dataclasses
+import json
 import random
 import time
 from contextlib import contextmanager, nullcontext
@@ -159,18 +163,26 @@ def _raw_keys(top_k: tuple[int, ...]) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 class CSVLogger:
-    """Дописывает строки в CSV; заголовок пишется только в новый файл."""
+    """
+    Дописывает строки в CSV; заголовок пишется только в новый файл.
 
-    def __init__(self, path: Path):
+    preamble — строка, которая в новом файле идёт перед заголовком с префиксом '# ' (описание
+    прогона). Читать такой лог: pd.read_csv(path, comment='#').
+    """
+
+    def __init__(self, path: Path, preamble: str | None = None):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.preamble = preamble
         self._initialized = False
 
     def log(self, row: dict) -> None:
         write_header = not self._initialized and not self.path.exists()
-        with open(self.path, 'a', newline='') as f:
+        with open(self.path, 'a', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=row.keys())
             if write_header:
+                if self.preamble is not None:
+                    f.write(f'# {self.preamble}\n')
                 writer.writeheader()
             writer.writerow(row)
         self._initialized = True
@@ -285,8 +297,6 @@ def fit(
 
     out_dir = Path(cfg.output.dir) / cfg.output.run_name
     out_dir.mkdir(parents=True, exist_ok=True)
-    train_logger = CSVLogger(out_dir / 'log_train.csv')
-    val_logger   = CSVLogger(out_dir / 'log_val.csv')
 
     # ------------------------------------------------------------------ #
     # Данные
@@ -294,7 +304,7 @@ def fit(
     d = cfg.data
     loaders = build_dataloaders(
         data_dir=d.data_dir, batch_size=d.batch_size, num_workers=d.num_workers,
-        seq_len=d.max_seq_len, seed=cfg.seed,
+        seq_len=d.max_seq_len, padding_idx=d.padding_idx, seed=cfg.seed,
     )
     train_loader, val_loader = loaders['train'], loaders['val']
 
@@ -312,6 +322,16 @@ def fit(
     n_frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)
     print(f'{type(model).__name__}: trainable {sum(p.numel() for p in params):,}, frozen {n_frozen:,}')
     model_cfg = model.config()      # в чекпойнт, его читают ноутбуки анализа
+
+    # Первая строка обоих логов — какая модель и как обучалась: весь yaml и итоговый config() модели
+    run_info = json.dumps({'model': type(model).__name__,
+                           'trainable_params': sum(p.numel() for p in params),
+                           'frozen_params': n_frozen,
+                           'config': dataclasses.asdict(cfg), 'model_cfg': model_cfg},
+                          ensure_ascii=False, default=str)
+    print(f'Run: {run_info}')
+    train_logger = CSVLogger(out_dir / 'log_train.csv', preamble=run_info)
+    val_logger   = CSVLogger(out_dir / 'log_val.csv', preamble=run_info)
 
     if opt.name not in OPTIMIZERS:
         raise ValueError(f'optimizer.name должен быть одним из {list(OPTIMIZERS)}, получено {opt.name!r}')
@@ -425,7 +445,7 @@ def fit(
 def main() -> dict[str, float]:
     """Точка входа: по model_type из yaml берёт модель из builders.MODELS и обучает её."""
     parser = argparse.ArgumentParser(description='Обучение модели по yaml-конфигу.')
-    parser.add_argument('--config', required=True, help='configs/<модель>.yaml')
+    parser.add_argument('--config', required=True, help='configs/<dataset>/<модель>.yaml')
     args = parser.parse_args()
 
     spec, cfg = load_model_config(args.config)

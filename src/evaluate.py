@@ -10,8 +10,9 @@ Full-rank protocol — стандарт в современных работах
 
 Оценка прогонов из командной строки (из корня проекта — пути в yaml относительные):
 
-    python src/evaluate.py --config configs/dreamrec.yaml --n-runs 5
+    python src/evaluate.py --config configs/atg/dreamrec.yaml --n-runs 5
     python src/evaluate.py --config ... --n-runs 3 --seeds 10 --splits test
+    python src/evaluate.py --config configs/toys/sasrec.yaml --checkpoint checkpoints/toys/sasrec_posloss_2/best.pt
     python src/evaluate.py --self-test
 
 Берутся best.pt прогонов <имя конфига>_1 … <имя конфига>_N из output.dir (так их называет
@@ -236,13 +237,15 @@ def evaluate_retrievals(
 
 def evaluate_runs(
     config_path: str,
-    n_runs: int,
+    n_runs: int | None = None,
     n_seeds: int = 5,
     splits: tuple[str, ...] = ('val', 'test'),
+    checkpoints: list[str] | None = None,
 ) -> dict:
     """
     Метрики best.pt прогонов <имя конфига>_1 … <имя конфига>_{n_runs} из output.dir по протоколу
-    тренера, у каждого — n_seeds сидов сэмплинга.
+    тренера, у каждого — n_seeds сидов сэмплинга. Вместо n_runs можно передать checkpoints —
+    явные пути к чекпойнтам, тогда имена прогонов не важны.
 
     Имена прогонов — как у scripts/run_seeds.py: run_name = <имя yaml без расширения>_<i>.
     Модель собирается один раз по конфигу (builders.MODELS[model_type]), веса чекпойнтов грузятся
@@ -257,9 +260,14 @@ def evaluate_runs(
     from data import build_dataloaders
     from train import seeded
 
+    if (n_runs is None) == (checkpoints is None):
+        raise ValueError('нужен ровно один из n_runs и checkpoints')
     spec, cfg = load_model_config(config_path)
-    prefix = Path(config_path).stem
-    paths  = [Path(cfg.output.dir) / f'{prefix}_{i}' / 'best.pt' for i in range(1, n_runs + 1)]
+    if checkpoints is not None:
+        paths = [Path(p) for p in checkpoints]
+    else:
+        prefix = Path(config_path).stem
+        paths  = [Path(cfg.output.dir) / f'{prefix}_{i}' / 'best.pt' for i in range(1, n_runs + 1)]
     missing = [str(p) for p in paths if not p.exists()]
     if missing:
         raise FileNotFoundError(f'нет чекпойнтов: {missing}')
@@ -267,7 +275,8 @@ def evaluate_runs(
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model  = spec.build(cfg).to(device)
     loaders = build_dataloaders(cfg.data.data_dir, batch_size=cfg.data.batch_size, num_workers=0,
-                                seq_len=cfg.data.max_seq_len, splits=splits)
+                                seq_len=cfg.data.max_seq_len, padding_idx=cfg.data.padding_idx,
+                                splits=splits)
     seeds = list(range(1, n_seeds + 1))
 
     runs = []
@@ -493,8 +502,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description='Метрики прогонов модели на val/test по протоколу тренера с разбросом '
                     'по прогонам и сидам сэмплинга.')
-    parser.add_argument('--config', help='yaml, с которым обучалась модель (configs/<model>.yaml)')
+    parser.add_argument('--config', help='yaml, с которым обучалась модель (configs/<dataset>/<model>.yaml)')
     parser.add_argument('--n-runs', type=int, help='сколько прогонов взять: best.pt из <model>_1 … <model>_N')
+    parser.add_argument('--checkpoint', nargs='+', help='вместо --n-runs: пути к конкретным чекпойнтам')
     parser.add_argument('--seeds', type=int, default=5, help='число сидов сэмплинга: 1, 2, 3, ... (по умолчанию 5)')
     parser.add_argument('--splits', nargs='+', default=['val', 'test'], choices=['val', 'test'])
     parser.add_argument('--self-test', action='store_true', help='проверить формулы HR/NDCG и выйти')
@@ -503,10 +513,11 @@ def main() -> None:
     if args.self_test:
         _self_test()
         return
-    if not args.config or not args.n_runs:
-        parser.error('нужны --config и --n-runs (или --self-test)')
+    if not args.config or bool(args.n_runs) == bool(args.checkpoint):
+        parser.error('нужны --config и ровно один из --n-runs / --checkpoint (или --self-test)')
 
-    report = evaluate_runs(args.config, n_runs=args.n_runs, n_seeds=args.seeds, splits=tuple(args.splits))
+    report = evaluate_runs(args.config, n_runs=args.n_runs, n_seeds=args.seeds, splits=tuple(args.splits),
+                           checkpoints=args.checkpoint)
     _print_report(report)
 
 
