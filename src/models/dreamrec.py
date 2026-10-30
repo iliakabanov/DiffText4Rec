@@ -30,9 +30,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.components import AlphaFuseItemEmbedding, ConcatDenoiser, HistoryEncoder, ItemEmbedding
+from models.losses import LOSS_METRICS, infonce_loss
 from models.processes import DDPM, FlowMatching
 
 RETRIEVAL_METRICS = ('cosine', 'dot', 'l2')
+LOSSES            = ('mse', 'infonce')
 
 
 def retrieve(oracle: torch.Tensor, items: torch.Tensor, metric: str, top_k: int) -> torch.LongTensor:
@@ -57,6 +59,12 @@ class GenerativeRecommender(nn.Module):
         train_prefixes:   True — лосс на каждом префиксе истории за один проход энкодера
                           (каждая позиция предсказывает следующий товар), False — только
                           последняя позиция → target.
+        loss:             'mse' — регрессия процесса (DDPM: x̂_0 к x_0; FM: к скорости или z_1);
+                          'infonce' — предсказание сети x̂_0 из зашумлённого таргета против
+                          таргета и neg_ratio случайных негативов (models.losses.infonce_loss).
+        loss_metric:      сходство x̂_0 и эмбеддингов товаров в infonce: 'dot' или 'cosine'.
+        neg_ratio:        число негативов на позитив (только infonce).
+        temperature:      логиты infonce = сходство / temperature.
     """
 
     def __init__(
@@ -69,10 +77,18 @@ class GenerativeRecommender(nn.Module):
         w_cfg: float,
         retrieval_metric: str,
         train_prefixes: bool = False,
+        loss: str = 'mse',
+        loss_metric: str = 'dot',
+        neg_ratio: int = 64,
+        temperature: float = 1.0,
     ):
         super().__init__()
         if retrieval_metric not in RETRIEVAL_METRICS:
             raise ValueError(f'retrieval_metric должен быть одним из {RETRIEVAL_METRICS}, получено {retrieval_metric!r}')
+        if loss not in LOSSES:
+            raise ValueError(f'loss должен быть одним из {LOSSES}, получено {loss!r}')
+        if loss_metric not in LOSS_METRICS:
+            raise ValueError(f'loss_metric должен быть одним из {LOSS_METRICS}, получено {loss_metric!r}')
         self.items    = items
         self.encoder  = encoder
         self.denoiser = denoiser
@@ -81,6 +97,10 @@ class GenerativeRecommender(nn.Module):
         self.w_cfg    = w_cfg
         self.retrieval_metric = retrieval_metric
         self.train_prefixes   = train_prefixes
+        self.loss        = loss
+        self.loss_metric = loss_metric
+        self.neg_ratio   = neg_ratio
+        self.temperature = temperature
 
     @property
     def d_emb(self) -> int:
@@ -104,13 +124,22 @@ class GenerativeRecommender(nn.Module):
         """
         if not self.train_prefixes:
             h = self.denoiser.drop_condition(self.encode_history(history, mask), self.p_uncond)
-            return self.process.loss(self.denoiser, self.items(target), h)
+            return self._loss(h, target)
 
         labels = torch.cat([history[:, 1:], target[:, None]], dim=1)   # следующий товар для позиции
         valid = mask > 0                                               # padding слева: i реальна → i+1 тоже
         h = self.encoder.encode(self.items(history), mask)[valid]      # (N, d_emb)
         h = self.denoiser.drop_condition(h, self.p_uncond)             # CFG dropout — на каждый префикс
-        return self.process.loss(self.denoiser, self.items(labels[valid]), h)
+        return self._loss(h, labels[valid])
+
+    def _loss(self, h: torch.Tensor, target: torch.LongTensor) -> torch.Tensor:
+        """h (N, d_emb) — условие, target (N,) — индексы товаров."""
+        x_clean = self.items(target)
+        if self.loss == 'mse':
+            return self.process.loss(self.denoiser, x_clean, h)
+        x_hat = self.process.predict_clean(self.denoiser, x_clean, h)   # (N, d_emb)
+        return infonce_loss(x_hat, target, self.items, self.n_items, self.neg_ratio,
+                            self.loss_metric, self.temperature)
 
     @torch.no_grad()
     def sample(self, h: torch.Tensor, num_steps: int | None = None,
@@ -132,12 +161,16 @@ class GenerativeRecommender(nn.Module):
             'model': type(self).__name__,
             'n_items': self.n_items,
             'd_emb': self.d_emb,
+            'n_layers': len(self.encoder.blocks),
             **self.items.info,
             **self.process.config(),
             'p_uncond': self.p_uncond,
             'w_cfg': self.w_cfg,
             'retrieval_metric': self.retrieval_metric,
             'train_prefixes': self.train_prefixes,
+            'loss': self.loss,
+            **({'loss_metric': self.loss_metric, 'neg_ratio': self.neg_ratio,
+                'temperature': self.temperature} if self.loss == 'infonce' else {}),
         }
 
     def param_summary(self) -> dict:
@@ -151,19 +184,20 @@ class GenerativeRecommender(nn.Module):
 # --------------------------------------------------------------------------- #
 
 class DreamRec(GenerativeRecommender):
-    """DreamRec: ID-эмбеддинги товаров обучаются с нуля, процесс — DDPM."""
+    """DreamRec: ID-эмбеддинги товаров обучаются с нуля (freeze_items — остаются случайными), процесс — DDPM."""
 
     def __init__(self, *, n_items: int, padding_idx: int, d_emb: int, n_heads: int, d_ff: int,
                  dropout: float, max_seq_len: int, T: int, beta_schedule: str,
                  p_uncond: float, w_cfg: float, retrieval_metric: str,
-                 train_prefixes: bool = False):
+                 train_prefixes: bool = False, n_layers: int = 1, freeze_items: bool = False,
+                 **loss_kwargs):
         super().__init__(
-            items=ItemEmbedding.learned(n_items, d_emb, padding_idx),
-            encoder=HistoryEncoder(d_emb, n_heads, d_ff, dropout, max_seq_len),
+            items=ItemEmbedding.learned(n_items, d_emb, padding_idx, frozen=freeze_items),
+            encoder=HistoryEncoder(d_emb, n_heads, d_ff, dropout, max_seq_len, n_layers),
             denoiser=ConcatDenoiser(d_emb),
             process=DDPM(T, beta_schedule),
             p_uncond=p_uncond, w_cfg=w_cfg, retrieval_metric=retrieval_metric,
-            train_prefixes=train_prefixes,
+            train_prefixes=train_prefixes, **loss_kwargs,
         )
 
 
@@ -174,16 +208,16 @@ class DreamRecText(GenerativeRecommender):
                  n_components: int, per_component_whitening: bool, whitening_cache: str | Path,
                  n_heads: int, d_ff: int, dropout: float, max_seq_len: int,
                  T: int, beta_schedule: str, p_uncond: float, w_cfg: float, retrieval_metric: str,
-                 train_prefixes: bool = False):
+                 train_prefixes: bool = False, n_layers: int = 1, **loss_kwargs):
         items = ItemEmbedding.text(item_embeddings_raw, padding_idx, use_pca, n_components,
                                    per_component_whitening, whitening_cache)
         super().__init__(
             items=items,
-            encoder=HistoryEncoder(items.d_emb, n_heads, d_ff, dropout, max_seq_len),
+            encoder=HistoryEncoder(items.d_emb, n_heads, d_ff, dropout, max_seq_len, n_layers),
             denoiser=ConcatDenoiser(items.d_emb),
             process=DDPM(T, beta_schedule),
             p_uncond=p_uncond, w_cfg=w_cfg, retrieval_metric=retrieval_metric,
-            train_prefixes=train_prefixes,
+            train_prefixes=train_prefixes, **loss_kwargs,
         )
 
 
@@ -194,16 +228,16 @@ class DreamRecFMText(GenerativeRecommender):
                  n_components: int, per_component_whitening: bool, whitening_cache: str | Path,
                  n_heads: int, d_ff: int, dropout: float, max_seq_len: int, prediction: str,
                  p_uncond: float, w_cfg: float, retrieval_metric: str,
-                 train_prefixes: bool = False):
+                 train_prefixes: bool = False, n_layers: int = 1, **loss_kwargs):
         items = ItemEmbedding.text(item_embeddings_raw, padding_idx, use_pca, n_components,
                                    per_component_whitening, whitening_cache)
         super().__init__(
             items=items,
-            encoder=HistoryEncoder(items.d_emb, n_heads, d_ff, dropout, max_seq_len),
+            encoder=HistoryEncoder(items.d_emb, n_heads, d_ff, dropout, max_seq_len, n_layers),
             denoiser=ConcatDenoiser(items.d_emb),
             process=FlowMatching(prediction),
             p_uncond=p_uncond, w_cfg=w_cfg, retrieval_metric=retrieval_metric,
-            train_prefixes=train_prefixes,
+            train_prefixes=train_prefixes, **loss_kwargs,
         )
 
 
@@ -214,15 +248,15 @@ class DreamRecAlphaFuse(GenerativeRecommender):
                  null_dim: int | None, null_thres: float | None, fusion: str, id_init: str,
                  whitening_cache: str | Path, n_heads: int, d_ff: int, dropout: float,
                  max_seq_len: int, T: int, beta_schedule: str, p_uncond: float, w_cfg: float,
-                 retrieval_metric: str, train_prefixes: bool = False):
+                 retrieval_metric: str, train_prefixes: bool = False, n_layers: int = 1, **loss_kwargs):
         super().__init__(
             items=AlphaFuseItemEmbedding(item_embeddings_raw, padding_idx, d_emb, null_dim,
                                          null_thres, fusion, id_init, whitening_cache),
-            encoder=HistoryEncoder(d_emb, n_heads, d_ff, dropout, max_seq_len),
+            encoder=HistoryEncoder(d_emb, n_heads, d_ff, dropout, max_seq_len, n_layers),
             denoiser=ConcatDenoiser(d_emb),
             process=DDPM(T, beta_schedule),
             p_uncond=p_uncond, w_cfg=w_cfg, retrieval_metric=retrieval_metric,
-            train_prefixes=train_prefixes,
+            train_prefixes=train_prefixes, **loss_kwargs,
         )
 
 
@@ -254,6 +288,10 @@ if __name__ == '__main__':
     with tempfile.TemporaryDirectory() as tmp:
         models = {
             'DreamRec': DreamRec(n_items=N_ITEMS, d_emb=D, T=50, beta_schedule='exp', **common),
+            'DreamRec (2 слоя)': DreamRec(n_items=N_ITEMS, d_emb=D, T=50, beta_schedule='exp', n_layers=2,
+                                          **common),
+            'DreamRec (замор.)': DreamRec(n_items=N_ITEMS, d_emb=D, T=50, beta_schedule='exp', freeze_items=True,
+                                          **common),
             'DreamRecText (pca)': DreamRecText(item_embeddings_raw=emb_raw, use_pca=True, n_components=D,
                                                per_component_whitening=True,
                                                whitening_cache=Path(tmp) / 'wh.npz', T=50,
@@ -290,11 +328,11 @@ if __name__ == '__main__':
                     assert torch.equal(model.items.table[:, :D - k], model.items.semantic.weight[:N_ITEMS, :D - k])
             else:
                 grad_items = model.items.embedding.weight.grad
-                if name == 'DreamRec':
+                if isinstance(model, DreamRec) and model.items.embedding.weight.requires_grad:
                     assert grad_items is not None and grad_items[N_ITEMS].abs().max() == 0.0
                 else:
                     assert grad_items is None
-            assert model.encoder.block.parameters().__next__().grad is not None
+            assert all(next(b.parameters()).grad is not None for b in model.encoder.blocks)
 
             # Лосс на префиксах: конечен, даёт градиенты, и при истории из одного товара
             # совпадает с обычным (позиция ровно одна; шум фиксируем сидом)
@@ -313,6 +351,23 @@ if __name__ == '__main__':
                 torch.manual_seed(1); b = model.compute_loss(one, target, m_one)
             assert torch.allclose(a, b, atol=1e-5), (name, a.item(), b.item())
             model.train()
+
+            # infonce: конечен, даёт градиенты денойзеру, энкодеру и (у DreamRec) эмбеддингам товаров;
+            # mse после переключения обратно не изменился (predict_clean тянет тот же шум)
+            torch.manual_seed(2); mse_before = model.compute_loss(history, target, mask)
+            for metric in LOSS_METRICS:
+                model.zero_grad(set_to_none=True)
+                model.loss, model.loss_metric = 'infonce', metric
+                loss_nce = model.compute_loss(history, target, mask)
+                loss_nce.backward()
+                assert torch.isfinite(loss_nce) and model.denoiser.linear.weight.grad is not None
+                assert next(model.encoder.blocks.parameters()).grad is not None
+                if isinstance(model, DreamRec) and model.items.embedding.weight.requires_grad:
+                    assert model.items.embedding.weight.grad[N_ITEMS].abs().max() == 0.0
+            model.loss = 'mse'
+            torch.manual_seed(2); mse_after = model.compute_loss(history, target, mask)
+            assert torch.equal(mse_before, mse_after)
+            model.zero_grad(set_to_none=True)
 
             model.eval()
             for metric in RETRIEVAL_METRICS:

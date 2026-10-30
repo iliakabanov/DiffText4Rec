@@ -22,6 +22,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from models.losses import LOSS_METRICS as SASREC_LOSS_METRICS, infonce_loss
+
 SASREC_RETRIEVAL_METRICS = ('cosine', 'dot')
 
 
@@ -112,13 +114,18 @@ class SASRec(nn.Module):
                      предсказывает следующий товар) за один forward, как в оригинальном SASRec;
                      False — только последняя позиция → next.
         neg_ratio:   число случайных негативов на один позитив (только для 'infonce').
-        temperature: температура InfoNCE (только для 'infonce').
+        temperature: температура: логиты лосса = сходство / temperature (оба лосса).
+        loss_metric: сходство h и эмбеддингов товаров в лоссе: 'cosine' — L2-нормировка обоих,
+                     логиты ограничены ±1/temperature; 'dot' — скалярное произведение, нормы
+                     эмбеддингов обучаются и влияют на логиты.
         retrieval_metric: ранжирование в recommend(): 'cosine' — косинус h и эмбеддингов товаров;
                      'dot' — логиты (h · эмбеддинги при tie_weights, иначе output_proj), здесь на
                      порядок влияют и нормы эмбеддингов товаров.
         items:      внешний модуль эмбеддингов товаров с интерфейсом ItemEmbedding
                      (forward(idx), table, d_emb, info) вместо собственной обучаемой таблицы;
                      требует tie_weights=True. None — своя таблица item_embedding.
+        freeze_items: True — своя таблица item_embedding остаётся случайной инициализацией
+                     N(0, 0.02) и не обучается (фиксированные случайные коды товаров).
     """
 
     def __init__(
@@ -135,11 +142,18 @@ class SASRec(nn.Module):
         loss: str = 'infonce',
         neg_ratio: int = 64,
         temperature: float = 0.07,
+        loss_metric: str = 'cosine',
         retrieval_metric: str = 'cosine',
         train_prefixes: bool = False,
         items: nn.Module | None = None,
+        freeze_items: bool = False,
     ):
         super().__init__()
+        if freeze_items and items is not None:
+            raise ValueError('freeze_items относится к своей таблице item_embedding, а не к внешним items')
+        if loss_metric not in SASREC_LOSS_METRICS:
+            raise ValueError(f'loss_metric должен быть одним из {SASREC_LOSS_METRICS}, '
+                             f'получено {loss_metric!r}')
         if retrieval_metric not in SASREC_RETRIEVAL_METRICS:
             raise ValueError(f'retrieval_metric должен быть одним из {SASREC_RETRIEVAL_METRICS}, '
                              f'получено {retrieval_metric!r}')
@@ -158,8 +172,10 @@ class SASRec(nn.Module):
         self.loss        = loss
         self.neg_ratio   = neg_ratio
         self.temperature = temperature
+        self.loss_metric = loss_metric
         self.retrieval_metric = retrieval_metric
         self.train_prefixes   = train_prefixes
+        self.freeze_items     = freeze_items
 
         # Эмбеддинги товаров: внешний модуль или своя обучаемая таблица.
         # padding_idx обнуляет вектор и запрещает градиент через него.
@@ -183,6 +199,8 @@ class SASRec(nn.Module):
             self.output_proj = nn.Linear(d_model, n_items, bias=False)
 
         self._init_weights()
+        if freeze_items:
+            self.item_embedding.weight.requires_grad_(False)
 
     # ------------------------------------------------------------------ #
     # Init
@@ -284,51 +302,14 @@ class SASRec(nn.Module):
 
     def _loss(self, h: torch.Tensor, target: torch.LongTensor) -> torch.Tensor:
         if self.loss == 'infonce':
-            return self._infonce_loss(h, target)
-        return F.cross_entropy(self._logits(h), target)
-
-    def _infonce_loss(
-        self,
-        h: torch.Tensor,
-        target: torch.LongTensor,
-    ) -> torch.Tensor:
-        """
-        InfoNCE: контрастивный loss с neg_ratio случайными негативами.
-
-        Logit = cosine_similarity(h, e) / temperature.
-        Метка 0 — позитив стоит на первом месте в конкатенированном тензоре.
-
-        Args:
-            h:      (B, d_model) — user representation
-            target: (B,) — индексы позитивных айтемов
-        """
-        B      = h.shape[0]
-        device = h.device
-
-        # Случайные негативы: (B, neg_ratio), исключаем совпадения с позитивом
-        neg = torch.randint(0, self.n_items, (B, self.neg_ratio), device=device)
-        # Маскируем совпадения одним проходом (коллизии редки, двойной цикл не нужен)
-        collision = (neg == target.unsqueeze(1))
-        if collision.any():
-            replacement = torch.randint(0, self.n_items, (B, self.neg_ratio), device=device)
-            neg = torch.where(collision, replacement, neg)
-
-        # Эмбеддинги позитива и негативов
-        e_pos = self._embed(target)                                      # (B, d_model)
-        e_neg = self._embed(neg)                                         # (B, neg_ratio, d_model)
-
-        # L2-нормировка
-        h     = F.normalize(h,     dim=-1)                              # (B, d_model)
-        e_pos = F.normalize(e_pos, dim=-1)                              # (B, d_model)
-        e_neg = F.normalize(e_neg, dim=-1)                              # (B, neg_ratio, d_model)
-
-        # Косинусные логиты
-        pos_logit = (h * e_pos).sum(dim=-1, keepdim=True)               # (B, 1)
-        neg_logit = torch.bmm(e_neg, h.unsqueeze(-1)).squeeze(-1)       # (B, neg_ratio)
-
-        logits = torch.cat([pos_logit, neg_logit], dim=-1) / self.temperature  # (B, 1+neg_ratio)
-        labels = torch.zeros(B, dtype=torch.long, device=device)        # позитив на индексе 0
-        return F.cross_entropy(logits, labels)
+            return infonce_loss(h, target, self._embed, self.n_items, self.neg_ratio,
+                                self.loss_metric, self.temperature)
+        if self.loss_metric == 'cosine':
+            W = self._item_table() if self.tie_weights else self.output_proj.weight
+            logits = F.normalize(h, dim=-1) @ F.normalize(W, dim=-1).T
+        else:
+            logits = self._logits(h)
+        return F.cross_entropy(logits / self.temperature, target)
 
     # ------------------------------------------------------------------ #
     # Recommend
@@ -395,8 +376,10 @@ class SASRec(nn.Module):
             'loss': self.loss,
             'neg_ratio': self.neg_ratio,
             'temperature': self.temperature,
+            'loss_metric': self.loss_metric,
             'retrieval_metric': self.retrieval_metric,
             'train_prefixes': self.train_prefixes,
+            **({'freeze_items': True} if self.freeze_items else {}),
             **(self.items.info if self.items is not None else {}),
         }
 
@@ -416,7 +399,7 @@ class SASRecAlphaFuse(SASRec):
                  null_dim: int | None, null_thres: float | None, fusion: str, id_init: str,
                  whitening_cache, n_heads: int, n_layers: int, d_ff: int, dropout: float,
                  max_seq_len: int, loss: str, neg_ratio: int, temperature: float,
-                 retrieval_metric: str, train_prefixes: bool = False):
+                 retrieval_metric: str, loss_metric: str = 'cosine', train_prefixes: bool = False):
         # Импорт здесь: models.components сам импортирует SASRecBlock из этого модуля
         from models.components import AlphaFuseItemEmbedding
 
@@ -426,7 +409,7 @@ class SASRecAlphaFuse(SASRec):
             n_items=items.n_items, padding_idx=padding_idx, d_model=d_model, n_heads=n_heads,
             n_layers=n_layers, d_ff=d_ff, dropout=dropout, max_seq_len=max_seq_len,
             tie_weights=True, loss=loss, neg_ratio=neg_ratio, temperature=temperature,
-            retrieval_metric=retrieval_metric, train_prefixes=train_prefixes, items=items,
+            loss_metric=loss_metric, retrieval_metric=retrieval_metric, train_prefixes=train_prefixes, items=items,
         )
 
 
@@ -507,6 +490,22 @@ if __name__ == '__main__':
         model.train()
         assert torch.allclose(a, b, atol=1e-5), (a.item(), b.item())
     print(f'Позиционный лосс: {loss_pref.item():.4f} (последняя позиция {loss.item():.4f})  OK')
+
+    # Test 4d: loss_metric — оба сходства в обоих лоссах; dot зависит от нормы h, cosine нет
+    h_rand = torch.randn(B, 256, device=device)
+    for loss_name in ('infonce', 'ce'):
+        model.loss = loss_name
+        for metric in SASREC_LOSS_METRICS:
+            model.loss_metric = metric
+            with torch.no_grad():
+                torch.manual_seed(1)                # одни и те же негативы infonce
+                l1 = model._loss(h_rand, target)
+                torch.manual_seed(1)
+                l3 = model._loss(3.0 * h_rand, target)
+            assert torch.isfinite(l1)
+            assert torch.allclose(l1, l3, atol=1e-5) == (metric == 'cosine'), (loss_name, metric)
+    model.loss, model.loss_metric = 'infonce', 'cosine'
+    print('loss_metric cosine/dot в infonce и ce  OK')
 
     # Test 4c: при любом числе слоёв представление живое и разное у разных историй.
     # Раньше со второго блока NaN с padding-позиций расползался на реальные, h обнулялся

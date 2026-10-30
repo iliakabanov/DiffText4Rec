@@ -18,13 +18,31 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+import numpy as np
 import torch.nn as nn
 import yaml
 
 from config import TextDataConfig, TrainConfig, load_config
-from data import load_item_embeddings
+from data import load_item_embeddings, shuffle_item_embeddings
 from models.dreamrec import DreamRec, DreamRecAlphaFuse, DreamRecFMText, DreamRecText
 from models.sasrec import SASRec, SASRecAlphaFuse
+
+
+def _text_embeddings(data: TextDataConfig) -> np.ndarray:
+    """Сырые текстовые эмбеддинги товаров; при shuffle_embeddings_seed — с перемешанными строками."""
+    emb = load_item_embeddings(data.emb_path)
+    print(f'Item embeddings: {emb.shape}')
+    if data.shuffle_embeddings_seed is not None:
+        emb = shuffle_item_embeddings(emb, data.shuffle_embeddings_seed)
+        print(f'Item embeddings перемешаны (seed {data.shuffle_embeddings_seed}): семантика оторвана от товаров')
+    return emb
+
+
+def _tag_shuffle(model: nn.Module, data: TextDataConfig) -> nn.Module:
+    """Помечает перемешивание в model_cfg чекпойнта (через items.info), чтобы прогоны различались."""
+    if data.shuffle_embeddings_seed is not None:
+        model.items.info['shuffle_embeddings_seed'] = data.shuffle_embeddings_seed
+    return model
 
 
 # --------------------------------------------------------------------------- #
@@ -44,6 +62,8 @@ class SASRecModelConfig:
     temperature: float
     retrieval_metric: str         # cosine, dot
     train_prefixes: bool = False  # true — лосс на каждой позиции (оригинальный SASRec) за один forward
+    loss_metric: str = 'cosine'   # сходство в лоссе: cosine, dot
+    freeze_items: bool = False    # true — эмбеддинги товаров остаются случайными N(0, 0.02), не обучаются
 
 
 @dataclass
@@ -66,8 +86,10 @@ def build_sasrec(cfg: SASRecConfig) -> SASRec:
         loss=m.loss,
         neg_ratio=m.neg_ratio,
         temperature=m.temperature,
+        loss_metric=m.loss_metric,
         retrieval_metric=m.retrieval_metric,
         train_prefixes=m.train_prefixes,
+        freeze_items=m.freeze_items,
     )
 
 
@@ -91,6 +113,7 @@ class SASRecAlphaFuseModelConfig:
     temperature: float
     retrieval_metric: str         # cosine, dot
     train_prefixes: bool = False  # true — лосс на каждой позиции (оригинальный SASRec) за один forward
+    loss_metric: str = 'cosine'   # сходство в лоссе: cosine, dot
 
 
 @dataclass
@@ -101,9 +124,8 @@ class SASRecAlphaFuseConfig(TrainConfig):
 
 def build_sasrec_alphafuse(cfg: SASRecAlphaFuseConfig) -> SASRecAlphaFuse:
     m = cfg.model
-    emb_raw = load_item_embeddings(cfg.data.emb_path)
-    print(f'Item embeddings: {emb_raw.shape}')
-    return SASRecAlphaFuse(
+    emb_raw = _text_embeddings(cfg.data)
+    return _tag_shuffle(SASRecAlphaFuse(
         item_embeddings_raw=emb_raw,
         padding_idx=cfg.data.padding_idx,
         d_model=m.d_model,
@@ -120,9 +142,16 @@ def build_sasrec_alphafuse(cfg: SASRecAlphaFuseConfig) -> SASRecAlphaFuse:
         loss=m.loss,
         neg_ratio=m.neg_ratio,
         temperature=m.temperature,
+        loss_metric=m.loss_metric,
         retrieval_metric=m.retrieval_metric,
         train_prefixes=m.train_prefixes,
-    )
+    ), cfg.data)
+
+
+def _loss_kwargs(m) -> dict:
+    """Параметры лосса генеративных моделей (models.dreamrec.GenerativeRecommender)."""
+    return dict(loss=m.loss, loss_metric=m.loss_metric, neg_ratio=m.neg_ratio,
+                temperature=m.temperature)
 
 
 # --------------------------------------------------------------------------- #
@@ -141,6 +170,12 @@ class DreamRecModelConfig:
     w_cfg:            float
     retrieval_metric: str      # cosine, dot, l2
     train_prefixes:   bool = False   # true — лосс на каждом префиксе истории за один проход
+    loss:             str = 'mse'    # mse — регрессия процесса; infonce — x̂_0 против таргета и негативов
+    loss_metric:      str = 'dot'    # сходство в infonce: dot, cosine
+    neg_ratio:        int = 64       # негативов на позитив (infonce)
+    temperature:      float = 1.0    # логиты infonce = сходство / temperature
+    n_layers:         int = 1        # число SASRec-блоков в энкодере истории
+    freeze_items:     bool = False   # true — эмбеддинги товаров остаются случайными N(0, 1), не обучаются
 
 
 @dataclass
@@ -155,6 +190,7 @@ def build_dreamrec(cfg: DreamRecConfig) -> DreamRec:
         padding_idx=cfg.data.padding_idx,
         d_emb=m.d_emb,
         n_heads=m.n_heads,
+        n_layers=m.n_layers,
         d_ff=m.d_ff,
         dropout=m.dropout,
         max_seq_len=cfg.data.max_seq_len,
@@ -164,6 +200,8 @@ def build_dreamrec(cfg: DreamRecConfig) -> DreamRec:
         w_cfg=m.w_cfg,
         retrieval_metric=m.retrieval_metric,
         train_prefixes=m.train_prefixes,
+        freeze_items=m.freeze_items,
+        **_loss_kwargs(m),
     )
 
 
@@ -185,6 +223,11 @@ class DreamRecTextModelConfig:
     w_cfg:                   float
     retrieval_metric:        str      # cosine, dot, l2
     train_prefixes:          bool = False   # true — лосс на каждом префиксе истории за один проход
+    loss:                    str = 'mse'    # mse — регрессия процесса; infonce — x̂_0 против таргета и негативов
+    loss_metric:             str = 'dot'    # сходство в infonce: dot, cosine
+    neg_ratio:               int = 64       # негативов на позитив (infonce)
+    temperature:             float = 1.0    # логиты infonce = сходство / temperature
+    n_layers:                int = 1        # число SASRec-блоков в энкодере истории
 
 
 @dataclass
@@ -195,9 +238,8 @@ class DreamRecTextConfig(TrainConfig):
 
 def build_dreamrec_text(cfg: DreamRecTextConfig) -> DreamRecText:
     m = cfg.model
-    emb_raw = load_item_embeddings(cfg.data.emb_path)
-    print(f'Item embeddings: {emb_raw.shape}')
-    return DreamRecText(
+    emb_raw = _text_embeddings(cfg.data)
+    return _tag_shuffle(DreamRecText(
         item_embeddings_raw=emb_raw,
         padding_idx=cfg.data.padding_idx,
         use_pca=m.use_pca,
@@ -205,6 +247,7 @@ def build_dreamrec_text(cfg: DreamRecTextConfig) -> DreamRecText:
         per_component_whitening=m.per_component_whitening,
         whitening_cache=cfg.data.whitening_cache,
         n_heads=m.n_heads,
+        n_layers=m.n_layers,
         d_ff=m.d_ff,
         dropout=m.dropout,
         max_seq_len=cfg.data.max_seq_len,
@@ -214,7 +257,8 @@ def build_dreamrec_text(cfg: DreamRecTextConfig) -> DreamRecText:
         w_cfg=m.w_cfg,
         retrieval_metric=m.retrieval_metric,
         train_prefixes=m.train_prefixes,
-    )
+        **_loss_kwargs(m),
+    ), cfg.data)
 
 
 # --------------------------------------------------------------------------- #
@@ -234,6 +278,11 @@ class DreamRecFMTextModelConfig:
     w_cfg:                   float
     retrieval_metric:        str      # cosine, dot, l2
     train_prefixes:          bool = False   # true — лосс на каждом префиксе истории за один проход
+    loss:                    str = 'mse'    # mse — регрессия процесса; infonce — x̂_0 против таргета и негативов
+    loss_metric:             str = 'dot'    # сходство в infonce: dot, cosine
+    neg_ratio:               int = 64       # негативов на позитив (infonce)
+    temperature:             float = 1.0    # логиты infonce = сходство / temperature
+    n_layers:                int = 1        # число SASRec-блоков в энкодере истории
 
 
 @dataclass
@@ -244,9 +293,8 @@ class DreamRecFMTextConfig(TrainConfig):
 
 def build_dreamrec_fm_text(cfg: DreamRecFMTextConfig) -> DreamRecFMText:
     m = cfg.model
-    emb_raw = load_item_embeddings(cfg.data.emb_path)
-    print(f'Item embeddings: {emb_raw.shape}')
-    return DreamRecFMText(
+    emb_raw = _text_embeddings(cfg.data)
+    return _tag_shuffle(DreamRecFMText(
         item_embeddings_raw=emb_raw,
         padding_idx=cfg.data.padding_idx,
         use_pca=m.use_pca,
@@ -254,6 +302,7 @@ def build_dreamrec_fm_text(cfg: DreamRecFMTextConfig) -> DreamRecFMText:
         per_component_whitening=m.per_component_whitening,
         whitening_cache=cfg.data.whitening_cache,
         n_heads=m.n_heads,
+        n_layers=m.n_layers,
         d_ff=m.d_ff,
         dropout=m.dropout,
         max_seq_len=cfg.data.max_seq_len,
@@ -262,7 +311,8 @@ def build_dreamrec_fm_text(cfg: DreamRecFMTextConfig) -> DreamRecFMText:
         w_cfg=m.w_cfg,
         retrieval_metric=m.retrieval_metric,
         train_prefixes=m.train_prefixes,
-    )
+        **_loss_kwargs(m),
+    ), cfg.data)
 
 
 # --------------------------------------------------------------------------- #
@@ -285,6 +335,11 @@ class DreamRecAlphaFuseModelConfig:
     w_cfg:            float
     retrieval_metric: str              # cosine, dot, l2
     train_prefixes:   bool = False     # true — лосс на каждом префиксе истории за один проход
+    loss:             str = 'mse'      # mse — регрессия процесса; infonce — x̂_0 против таргета и негативов
+    loss_metric:      str = 'dot'      # сходство в infonce: dot, cosine
+    neg_ratio:        int = 64         # негативов на позитив (infonce)
+    temperature:      float = 1.0      # логиты infonce = сходство / temperature
+    n_layers:         int = 1          # число SASRec-блоков в энкодере истории
 
 
 @dataclass
@@ -295,9 +350,8 @@ class DreamRecAlphaFuseConfig(TrainConfig):
 
 def build_dreamrec_alphafuse(cfg: DreamRecAlphaFuseConfig) -> DreamRecAlphaFuse:
     m = cfg.model
-    emb_raw = load_item_embeddings(cfg.data.emb_path)
-    print(f'Item embeddings: {emb_raw.shape}')
-    return DreamRecAlphaFuse(
+    emb_raw = _text_embeddings(cfg.data)
+    return _tag_shuffle(DreamRecAlphaFuse(
         item_embeddings_raw=emb_raw,
         padding_idx=cfg.data.padding_idx,
         d_emb=m.d_emb,
@@ -307,6 +361,7 @@ def build_dreamrec_alphafuse(cfg: DreamRecAlphaFuseConfig) -> DreamRecAlphaFuse:
         id_init=m.id_init,
         whitening_cache=cfg.data.whitening_cache,
         n_heads=m.n_heads,
+        n_layers=m.n_layers,
         d_ff=m.d_ff,
         dropout=m.dropout,
         max_seq_len=cfg.data.max_seq_len,
@@ -316,7 +371,8 @@ def build_dreamrec_alphafuse(cfg: DreamRecAlphaFuseConfig) -> DreamRecAlphaFuse:
         w_cfg=m.w_cfg,
         retrieval_metric=m.retrieval_metric,
         train_prefixes=m.train_prefixes,
-    )
+        **_loss_kwargs(m),
+    ), cfg.data)
 
 
 # --------------------------------------------------------------------------- #

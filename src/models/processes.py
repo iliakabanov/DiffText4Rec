@@ -70,13 +70,17 @@ class DDPM(nn.Module):
         """Шаг t (t = 0 — почти чистый x) → доля пути от шума к данным τ = 1 − t/T."""
         return 1.0 - t.float() / self.T
 
-    def loss(self, denoiser: ConcatDenoiser, x_clean: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-        """L = E_{t,ε} ‖x_0 − f(√ᾱ_t·x_0 + √(1−ᾱ_t)·ε, h, τ(t))‖²"""
+    def predict_clean(self, denoiser: ConcatDenoiser, x_clean: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        """Зашумляет x_clean на случайном шаге t и возвращает предсказание сети x̂_0 (B, d)."""
         t   = torch.randint(0, self.T, (x_clean.shape[0],), device=x_clean.device)
         eps = torch.randn_like(x_clean)
         ab  = self.alphas_cumprod[t].unsqueeze(-1)
         x_t = ab.sqrt() * x_clean + (1.0 - ab).sqrt() * eps
-        return F.mse_loss(denoiser(x_t, h, self.tau(t)), x_clean)
+        return denoiser(x_t, h, self.tau(t))
+
+    def loss(self, denoiser: ConcatDenoiser, x_clean: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        """L = E_{t,ε} ‖x_0 − f(√ᾱ_t·x_0 + √(1−ᾱ_t)·ε, h, τ(t))‖²"""
+        return F.mse_loss(self.predict_clean(denoiser, x_clean, h), x_clean)
 
     @torch.no_grad()
     def sample(
@@ -145,11 +149,23 @@ class FlowMatching(nn.Module):
             velocity  L = E_{τ,z_0} ‖(z_1 − z_0) − f(z_τ, h, τ)‖²
             x1        L = E_{τ,z_0} ‖z_1 − f(z_τ, h, τ)‖²
         """
+        z0, tau, z_tau = self._noised(x_clean)
+        target = x_clean - z0 if self.prediction == 'velocity' else x_clean
+        return F.mse_loss(denoiser(z_tau, h, tau), target)
+
+    def predict_clean(self, denoiser: ConcatDenoiser, x_clean: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        """Точка z_τ на случайном τ → предсказание сети x̂_1 (B, d); при velocity x̂_1 = z_τ + (1 − τ)·f."""
+        _, tau, z_tau = self._noised(x_clean)
+        out = denoiser(z_tau, h, tau)
+        return out if self.prediction == 'x1' else z_tau + (1.0 - tau[:, None]) * out
+
+    @staticmethod
+    def _noised(x_clean: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """z_0 ~ N(0, I), τ ~ U[0, 1], z_τ = (1−τ)·z_0 + τ·x_clean."""
         z0    = torch.randn_like(x_clean)
         tau   = torch.rand(x_clean.shape[0], device=x_clean.device)
         z_tau = (1.0 - tau[:, None]) * z0 + tau[:, None] * x_clean
-        target = x_clean - z0 if self.prediction == 'velocity' else x_clean
-        return F.mse_loss(denoiser(z_tau, h, tau), target)
+        return z0, tau, z_tau
 
     @torch.no_grad()
     def sample(

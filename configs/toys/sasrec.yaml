@@ -10,31 +10,33 @@ data:
   max_seq_len: 49          # окно истории; = seq_size из data_statis.df, длиннее историй в данных нет
 
 model:
-  d_model: 128
+  d_model: 512
   n_heads: 2
-  n_layers: 2
+  n_layers: 1
   d_ff: 512
   dropout: 0.2
   tie_weights: true
   loss: infonce
   neg_ratio: 64
-  temperature: 0.07
-  retrieval_metric: cosine   # cosine, dot
+  temperature: 1
+  loss_metric: dot        # сходство в лоссе: cosine, dot
+  retrieval_metric: dot   # cosine, dot
   train_prefixes: true    # лосс на каждой позиции истории за один forward
+  freeze_items: true      # эмбеддинги товаров остаются случайными N(0, 1), не обучаются
 
 optimizer:
   name: adam           # adam — weight_decay как L2 в градиенте; adamw — развязанный decay
-  lr: 1e-3
-  weight_decay: 1e-6
+  lr: 1e-4
+  weight_decay: 0
   grad_clip: 1.0
   num_epochs: 100
   warmup_epochs: 1
   ema_decay: null       # null — без EMA; 0.999 — полураспад ≈ 690 шагов (≈12 эпох)
 
 eval:
-  every_epochs: 1
+  every_epochs: 5
   top_k: [10, 20]
 
 output:
   dir: ./checkpoints/toys
-  run_name: sasrec_posloss_3
+  run_name: sasrec_d512_frozen

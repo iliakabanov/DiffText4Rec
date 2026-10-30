@@ -220,6 +220,18 @@ def load_item_embeddings(path: str | Path) -> np.ndarray:
     return emb.astype(np.float32)
 
 
+def shuffle_item_embeddings(emb: np.ndarray, seed: int) -> np.ndarray:
+    """
+    Строки эмбеддингов в случайной перестановке: товар i получает вектор товара perm[i].
+
+    Абляция семантики: набор векторов (распределение, нормы, спектр) не меняется, рвётся
+    только соответствие «товар ↔ его текст». Среднее и ковариация от порядка строк не зависят,
+    поэтому PCA/whitening и их кэш те же. Свой генератор — перестановка зависит только от seed,
+    а не от глобального RNG, и совпадает на обучении и оценке.
+    """
+    return emb[np.random.default_rng(seed).permutation(len(emb))]
+
+
 # --------------------------------------------------------------------------- #
 # Quick sanity-check entrypoint
 # --------------------------------------------------------------------------- #
@@ -253,6 +265,22 @@ if __name__ == '__main__':
         for a, b in zip(out['var'], out['pad']):
             assert torch.equal(a['history'], b['history']) and torch.equal(a['mask'], b['mask'])
         print('Оба формата seq дают одинаковые батчи  OK')
+
+    # Перемешивание эмбеддингов: перестановка детерминирована, whitening-статистики те же,
+    # а эмбеддинг товара i после whitening — исходный эмбеддинг товара perm[i]
+    from whitening import apply_whitening, compute_whitening
+    emb = np.random.default_rng(0).standard_normal((300, 24)).astype(np.float32)
+    shuf = shuffle_item_embeddings(emb, seed=7)
+    perm = np.random.default_rng(7).permutation(len(emb))
+    assert np.array_equal(shuf, emb[perm]) and np.array_equal(shuf, shuffle_item_embeddings(emb, seed=7))
+    assert not np.array_equal(shuf, emb)
+    wh, wh_shuf = (compute_whitening(e.astype(np.float64), n_components=16, per_component=True)
+                   for e in (emb, shuf))
+    for a, b in zip(wh, wh_shuf):
+        assert np.allclose(np.abs(a), np.abs(b), atol=1e-5)          # знак собственных векторов произволен
+    out = apply_whitening(emb, *wh)
+    assert np.allclose(apply_whitening(shuf, *wh), out[perm], atol=1e-5)
+    print('Перемешивание эмбеддингов: whitening не меняется, строки переставлены  OK')
 
     data_dir = Path(sys.argv[1] if len(sys.argv) > 1 else 'data/processed/toys')
     if not data_dir.exists():

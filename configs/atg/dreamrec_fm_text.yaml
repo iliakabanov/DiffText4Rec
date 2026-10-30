@@ -16,6 +16,7 @@ model:
   n_components: 3072                # игнорируется если use_pca: false
   per_component_whitening: True   # true = Var(E)=I точно (метод авторов); false = глобальный std
   n_heads: 4
+  n_layers: 1            # число SASRec-блоков в энкодере истории
   d_ff: 1024
   dropout: 0.1
   prediction: x1       # velocity — сеть предсказывает z_1 − z_0; x1 — сам эмбеддинг товара z_1

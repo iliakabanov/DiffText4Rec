@@ -1,4 +1,4 @@
-seed: 42
+seed: 1
 model_type: sasrec
 
 data:
@@ -10,7 +10,7 @@ data:
   max_seq_len: 10
 
 model:
-  d_model: 128
+  d_model: 3072
   n_heads: 1
   n_layers: 1
   d_ff: 128
@@ -19,14 +19,17 @@ model:
   loss: infonce
   neg_ratio: 64
   temperature: 0.07
-  retrieval_metric: dot   # cosine, dot
+  loss_metric: cosine     # сходство в лоссе: cosine, dot
+  retrieval_metric: cosine   # cosine, dot
+  train_prefixes: false    # лосс на каждой позиции истории за один forward
+  freeze_items: true       # эмбеддинги товаров остаются случайными N(0, 0.02), не обучаются
 
 optimizer:
   name: adam           # adam — weight_decay как L2 в градиенте; adamw — развязанный decay
-  lr: 1e-3
+  lr: 1e-4
   weight_decay: 1e-6
   grad_clip: 1.0
-  num_epochs: 100
+  num_epochs: 200
   warmup_epochs: 1
   ema_decay: null       # null — без EMA; 0.999 — полураспад ≈ 690 шагов (≈12 эпох)
 
@@ -36,4 +39,6 @@ eval:
 
 output:
   dir: ./checkpoints/atg
-  run_name: sasrec
+  run_name: sasrec_infonce_d512_frozen
+
+

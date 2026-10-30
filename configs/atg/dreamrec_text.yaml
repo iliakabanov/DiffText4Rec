@@ -5,6 +5,7 @@ data:
   data_dir: ./data/ATG
   emb_path: ./data/ATG/3large_emb.pickle
   whitening_cache: ./data/processed/whitening_cache.npz
+  shuffle_embeddings_seed: 1   # число — перемешать строки эмбеддингов (абляция семантики); null — как есть
   padding_idx: 11924
   n_items: 11924
   batch_size: 1024
@@ -16,6 +17,7 @@ model:
   n_components: 3072              # игнорируется если use_pca: false
   per_component_whitening: True   # true = Var(E)=I точно (метод авторов); false = глобальный std
   n_heads: 4
+  n_layers: 1            # число SASRec-блоков в энкодере истории
   d_ff: 1024
   dropout: 0.1
   T: 1000
@@ -40,4 +42,4 @@ eval:
 
 output:
   dir: ./checkpoints/atg
-  run_name: dreamrec_text
+  run_name: dreamrec_text_shuffled

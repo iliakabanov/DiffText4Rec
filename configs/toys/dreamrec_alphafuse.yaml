@@ -18,6 +18,7 @@ model:
   fusion: replace       # replace — как в статье для DreamRec (разд. 4.1.5); add — Eq. 10 и дефолт кода авторов (cover=False)
   id_init: normal
   n_heads: 1
+  n_layers: 1            # число SASRec-блоков в энкодере истории
   d_ff: 1024            # FFN AlphaFuse: скрытый слой = d
   dropout: 0.1
   T: 1000

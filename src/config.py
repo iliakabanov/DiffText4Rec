@@ -40,6 +40,7 @@ class TextDataConfig(DataConfig):
     """Данные моделей на текстовых эмбеддингах (DreamRecText, DreamRecFMText)."""
     emb_path:        str
     whitening_cache: str
+    shuffle_embeddings_seed: int | None = None   # число — перемешать строки эмбеддингов (абляция семантики)
 
 
 @dataclass

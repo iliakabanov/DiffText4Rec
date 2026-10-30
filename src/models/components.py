@@ -3,7 +3,7 @@
 
     ItemEmbedding   — эмбеддинги товаров: обучаемые с нуля или замороженные текстовые.
     AlphaFuseItemEmbedding — замороженные текстовые + обучаемые ID в их null-координатах.
-    HistoryEncoder  — история взаимодействий → conditioning-вектор h (один SASRec-блок).
+    HistoryEncoder  — история взаимодействий → conditioning-вектор h (n_layers SASRec-блоков).
     ConcatDenoiser  — сеть concat([x, h, t_emb]) → Linear(3d, d) с токеном «без условия» для CFG.
 
 Время во всех моделях — доля пути от шума к данным τ ∈ [0, 1]; на вход sinusoidal
@@ -74,11 +74,12 @@ class ItemEmbedding(nn.Module):
         self.embedding = nn.Embedding.from_pretrained(weight, freeze=not trainable, padding_idx=padding_idx)
 
     @classmethod
-    def learned(cls, n_items: int, d_emb: int, padding_idx: int) -> ItemEmbedding:
-        """Обучаемые эмбеддинги, инициализация N(0, 1)."""
+    def learned(cls, n_items: int, d_emb: int, padding_idx: int, frozen: bool = False) -> ItemEmbedding:
+        """Эмбеддинги с инициализацией N(0, 1); frozen=True — так и остаются фиксированными случайными кодами."""
         weight = torch.randn(n_items + 1, d_emb)
         weight[padding_idx] = 0.0
-        return cls(weight, padding_idx, trainable=True, info={'item_embedding': 'learned'})
+        return cls(weight, padding_idx, trainable=not frozen,
+                   info={'item_embedding': 'random_frozen' if frozen else 'learned'})
 
     @classmethod
     def text(
@@ -215,21 +216,30 @@ class AlphaFuseItemEmbedding(nn.Module):
 class HistoryEncoder(nn.Module):
     """
     История → conditioning-вектор h ∈ d_emb: эмбеддинги товаров + позиционные,
-    один каузальный SASRec-блок (pre-norm), LayerNorm, выход последней позиции
+    n_layers каузальных SASRec-блоков (pre-norm), LayerNorm, выход последней позиции
     (padding слева, поэтому последняя позиция — всегда последний реальный товар).
 
     encode() отдаёт все позиции: attention каузальный, поэтому позиция i — это conditioning
     для префикса истории до i-го товара включительно (нужно для обучения на префиксах).
     """
 
-    def __init__(self, d_emb: int, n_heads: int, d_ff: int, dropout: float, max_seq_len: int):
+    def __init__(self, d_emb: int, n_heads: int, d_ff: int, dropout: float, max_seq_len: int,
+                 n_layers: int = 1):
         super().__init__()
         self.n_heads       = n_heads
         self.pos_embedding = nn.Embedding(max_seq_len, d_emb)
         self.dropout       = nn.Dropout(dropout)
-        self.block         = SASRecBlock(d_emb, n_heads, d_ff, dropout)
+        self.blocks        = nn.ModuleList([SASRecBlock(d_emb, n_heads, d_ff, dropout)
+                                            for _ in range(n_layers)])
         self.norm          = nn.LayerNorm(d_emb)
         nn.init.zeros_(self.pos_embedding.weight)
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        # Чекпойнты до n_layers хранят единственный блок под именем block
+        old = prefix + 'block.'
+        for key in [k for k in state_dict if k.startswith(old)]:
+            state_dict[prefix + 'blocks.0.' + key[len(old):]] = state_dict.pop(key)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def encode(self, seq_emb: torch.Tensor, mask: torch.FloatTensor) -> torch.Tensor:
         """
@@ -242,7 +252,10 @@ class HistoryEncoder(nn.Module):
         """
         L = seq_emb.shape[1]
         x = self.dropout(seq_emb + self.pos_embedding(torch.arange(L, device=seq_emb.device)))
-        return self.norm(self.block(x, attn_mask=causal_attn_mask(mask, self.n_heads)))
+        attn_mask = causal_attn_mask(mask, self.n_heads)
+        for block in self.blocks:
+            x = block(x, attn_mask=attn_mask)
+        return self.norm(x)
 
     def forward(self, seq_emb: torch.Tensor, mask: torch.FloatTensor) -> torch.Tensor:
         """История → h (B, d_emb): conditioning последней позиции."""
