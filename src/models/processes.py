@@ -94,8 +94,9 @@ class DDPM(nn.Module):
         Ancestral DDPM по num_steps равномерно прорежённым шагам (None или ≥ T — по всем T).
         Posterior-коэффициенты пересчитываются под сетку; на полной сетке это обычный DDPM.
         """
+        x = denoiser.noise_like(h)
         n = self.T if num_steps is None else min(num_steps, self.T)
-        S = torch.unique(torch.linspace(0, self.T - 1, n, device=h.device).round().long())
+        S = torch.unique(torch.linspace(0, self.T - 1, n, device=x.device).round().long())
 
         ac      = self.alphas_cumprod[S]
         ac_prev = torch.cat([ac.new_ones(1), ac[:-1]])
@@ -104,9 +105,8 @@ class DDPM(nn.Module):
         coef_xt = (1.0 - betas).sqrt() * (1.0 - ac_prev) / (1.0 - ac)
         sigma   = ((1.0 - ac_prev) / (1.0 - ac) * betas).clamp(min=1e-20).sqrt()
 
-        x = torch.randn_like(h)
         for i in reversed(range(len(S))):
-            tau = self.tau(S[i].expand(h.shape[0]))
+            tau = self.tau(S[i].expand(x.shape[0]))
             x0  = denoiser.guided(x, h, tau, w_cfg)
             x   = coef_x0[i] * x0 + coef_xt[i] * x
             if i > 0:
@@ -181,9 +181,9 @@ class FlowMatching(nn.Module):
         """
         n  = num_steps or self.DEFAULT_STEPS
         dt = 1.0 / n
-        z  = torch.randn_like(h)
+        z  = denoiser.noise_like(h)
         for i in range(n):
-            tau = torch.full((h.shape[0],), i * dt, device=h.device)
+            tau = torch.full((z.shape[0],), i * dt, device=z.device)
             z   = z + dt * self.velocity(denoiser, z, h, tau, w_cfg)
         return z
 

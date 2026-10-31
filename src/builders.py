@@ -23,7 +23,9 @@ import torch.nn as nn
 import yaml
 
 from config import TextDataConfig, TrainConfig, load_config
-from data import load_item_embeddings, shuffle_item_embeddings
+from data import load_item_embeddings, load_sasrec_item_embeddings, shuffle_item_embeddings
+from models.components import ItemEmbedding
+from models.cosmos import DreamRecCosmos
 from models.dreamrec import DreamRec, DreamRecAlphaFuse, DreamRecFMText, DreamRecText
 from models.sasrec import SASRec, SASRecAlphaFuse
 
@@ -376,6 +378,108 @@ def build_dreamrec_alphafuse(cfg: DreamRecAlphaFuseConfig) -> DreamRecAlphaFuse:
 
 
 # --------------------------------------------------------------------------- #
+# DreamRecCosmos — DreamRec с денойзером по мотивам COSMOS, источник эмбеддингов задаётся в конфиге
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class CosmosItemsConfig:
+    source:            str               # learned — обучаемые с нуля; text — замороженные из emb_path;
+                                         # sasrec — замороженная таблица из чекпойнта SASRec
+    d_emb:             int | None = None   # только learned
+    emb_path:          str | None = None   # только text
+    sasrec_checkpoint: str | None = None   # только sasrec
+    # только text и sasrec, смысл — как у DreamRecText
+    use_pca:                 bool | None = None
+    n_components:            int | None = None
+    per_component_whitening: bool | None = None
+    whitening_cache:         str | None = None   # кэш не проверяет эмбеддинги — свой на каждый источник
+
+
+@dataclass
+class CosmosModelConfig:
+    items:            CosmosItemsConfig
+    # энкодер истории
+    n_heads:          int
+    n_layers:         int
+    d_ff:             int
+    dropout:          float
+    # денойзер
+    n_blocks:         int              # ≥ 2
+    denoiser_heads:   int
+    mlp_mult:         int              # скрытый слой SwiGLU = d · mlp_mult
+    denoiser_dropout: float            # dropout весов внимания
+    # процесс DDPM и ретривал
+    T:                int
+    beta_schedule:    str              # exp, linear, cosine
+    retrieval_metric: str              # cosine, dot, l2
+    train_prefixes:   bool = False     # true — лосс на каждом префиксе истории за один проход
+    loss:             str = 'mse'      # mse — регрессия процесса; infonce — x̂_0 против таргета и негативов
+    loss_metric:      str = 'dot'      # сходство в infonce: dot, cosine
+    neg_ratio:        int = 64         # негативов на позитив (infonce)
+    temperature:      float = 1.0      # логиты infonce = сходство / temperature
+
+
+@dataclass
+class CosmosConfig(TrainConfig):
+    model: CosmosModelConfig
+
+
+_PCA_FIELDS = {'use_pca', 'n_components', 'per_component_whitening', 'whitening_cache'}
+_COSMOS_ITEM_FIELDS = {
+    'learned': {'d_emb'},
+    'text':    {'emb_path'} | _PCA_FIELDS,
+    'sasrec':  {'sasrec_checkpoint'} | _PCA_FIELDS,
+}
+
+
+def _cosmos_items(cfg: CosmosConfig) -> ItemEmbedding:
+    """Эмбеддинги товаров по model.items: в yaml заданы все поля своего источника и только они."""
+    i, d = cfg.model.items, cfg.data
+    if i.source not in _COSMOS_ITEM_FIELDS:
+        raise ValueError(f'model.items.source должен быть одним из {list(_COSMOS_ITEM_FIELDS)}, получено {i.source!r}')
+    needed   = _COSMOS_ITEM_FIELDS[i.source]
+    optional = set().union(*_COSMOS_ITEM_FIELDS.values())
+    given    = {name for name in optional if getattr(i, name) is not None}
+    if given != needed:
+        raise ValueError(f'model.items при source={i.source}: нет полей {sorted(needed - given)}, '
+                         f'лишние поля {sorted(given - needed)}')
+
+    if i.source == 'learned':
+        return ItemEmbedding.learned(d.n_items, i.d_emb, d.padding_idx)
+
+    emb = (load_item_embeddings(i.emb_path) if i.source == 'text'
+           else load_sasrec_item_embeddings(i.sasrec_checkpoint, d.n_items))
+    print(f'Item embeddings ({i.source}): {emb.shape}')
+    if emb.shape[0] != d.n_items:
+        raise ValueError(f'В эмбеддингах {emb.shape[0]} строк, а в конфиге n_items={d.n_items}')
+    items = ItemEmbedding.text(emb, d.padding_idx, i.use_pca, i.n_components,
+                               i.per_component_whitening, i.whitening_cache)
+    items.info['item_embedding'] = i.source
+    return items
+
+
+def build_cosmos(cfg: CosmosConfig) -> DreamRecCosmos:
+    m = cfg.model
+    return DreamRecCosmos(
+        items=_cosmos_items(cfg),
+        n_heads=m.n_heads,
+        n_layers=m.n_layers,
+        d_ff=m.d_ff,
+        dropout=m.dropout,
+        max_seq_len=cfg.data.max_seq_len,
+        n_blocks=m.n_blocks,
+        denoiser_heads=m.denoiser_heads,
+        mlp_mult=m.mlp_mult,
+        denoiser_dropout=m.denoiser_dropout,
+        T=m.T,
+        beta_schedule=m.beta_schedule,
+        retrieval_metric=m.retrieval_metric,
+        train_prefixes=m.train_prefixes,
+        **_loss_kwargs(m),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Реестр
 # --------------------------------------------------------------------------- #
 
@@ -393,6 +497,7 @@ MODELS: dict[str, ModelSpec] = {
     'dreamrec_text':      ModelSpec(DreamRecTextConfig,      build_dreamrec_text),
     'dreamrec_fm_text':   ModelSpec(DreamRecFMTextConfig,    build_dreamrec_fm_text),
     'dreamrec_alphafuse': ModelSpec(DreamRecAlphaFuseConfig, build_dreamrec_alphafuse),
+    'dreamrec_cosmos':    ModelSpec(CosmosConfig,            build_cosmos),
 }
 
 

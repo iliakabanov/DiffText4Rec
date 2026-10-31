@@ -22,7 +22,7 @@ model:
   loss_metric: dot        # сходство в лоссе: cosine, dot
   retrieval_metric: dot   # cosine, dot
   train_prefixes: true    # лосс на каждой позиции истории за один forward
-  freeze_items: true      # эмбеддинги товаров остаются случайными N(0, 1), не обучаются
+  freeze_items: false     # эмбеддинги товаров остаются случайными N(0, 1), не обучаются
 
 optimizer:
   name: adam           # adam — weight_decay как L2 в градиенте; adamw — развязанный decay
@@ -39,4 +39,4 @@ eval:
 
 output:
   dir: ./checkpoints/toys
-  run_name: sasrec_d512_frozen
+  run_name: sasrec_d512_infonce64

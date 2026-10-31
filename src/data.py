@@ -220,6 +220,17 @@ def load_item_embeddings(path: str | Path) -> np.ndarray:
     return emb.astype(np.float32)
 
 
+def load_sasrec_item_embeddings(path: str | Path, n_items: int) -> np.ndarray:
+    """Таблица товаров из чекпойнта SASRec (best.pt / latest.pt) → float32-массив (N_items, d_model)."""
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
+    cfg = ckpt['model_cfg']
+    if cfg.get('model') != 'SASRec':
+        raise ValueError(f'{path}: ожидался SASRec с собственной таблицей, получен {cfg.get("model")!r}')
+    if cfg['n_items'] != n_items:
+        raise ValueError(f'{path}: в чекпойнте {cfg["n_items"]} товаров, в конфиге {n_items}')
+    return ckpt['model_state']['item_embedding.weight'][:n_items].float().numpy().astype(np.float32)
+
+
 def shuffle_item_embeddings(emb: np.ndarray, seed: int) -> np.ndarray:
     """
     Строки эмбеддингов в случайной перестановке: товар i получает вектор товара perm[i].

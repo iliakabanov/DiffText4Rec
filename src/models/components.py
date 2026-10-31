@@ -307,6 +307,10 @@ class ConcatDenoiser(nn.Module):
             out = (1.0 + w) * out - w * self(x, None, tau)
         return out
 
+    def noise_like(self, h: torch.Tensor) -> torch.Tensor:
+        """Стартовый шум сэмплинга; процессу форма условия неизвестна, её знает денойзер."""
+        return torch.randn_like(h)
+
     def drop_condition(self, h: torch.Tensor, p: float) -> torch.Tensor:
         """На обучении с вероятностью p заменяет h на null_token (CFG dropout)."""
         if not self.training or p == 0.0:

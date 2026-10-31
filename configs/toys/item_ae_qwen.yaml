@@ -1,0 +1,14 @@
+seed: 42
+
+data:
+  data_dir: ./data/processed/toys
+  emb_path: ./data/processed/toys/qwen3-embedding-0.6b_text.pickle
+  n_items: 20259           # = item_num из data_statis.df
+
+model:
+  d_input: 1024            # размерность исходного пространства = столбцов в emb_path
+  d_latent: 1024           # = d_input — без сжатия
+
+output:
+  dir: ./checkpoints/toys
+  run_name: item_ae_qwen
