@@ -12,11 +12,11 @@ data:
 model:
   items:
     source: sasrec         # learned — обучаемые с нуля; text — из emb_path; sasrec — таблица из чекпойнта SASRec
-    sasrec_checkpoint: ./checkpoints/toys/sasrec_d256/best.pt
+    sasrec_checkpoint: ./checkpoints/toys/sasrec_d512_ce/best.pt
     use_pca: true
-    n_components: 256      # ≤ d_model SASRec
+    n_components: 512      # ≤ d_model SASRec
     per_component_whitening: false   # true раздувает шумовые направления: HR@10 по последнему товару падает с 0.045 до 0.019
-    whitening_cache: ./data/processed/toys/whitening_cache_sasrec_d256.npz   # кэш не проверяет эмбеддинги — свой на каждый источник
+    whitening_cache: ./data/processed/toys/whitening_cache_sasrec_d512.npz   # кэш не проверяет эмбеддинги — свой на каждый источник
 
   # энкодер истории
   n_heads: 2
@@ -41,12 +41,12 @@ optimizer:
   lr: 1e-3
   weight_decay: 0.0
   grad_clip: 1.0
-  num_epochs: 150
+  num_epochs: 1000
   warmup_epochs: 0
   ema_decay: null
 
 eval:
-  every_epochs: 10
+  every_epochs: 50
   top_k: [10, 20]
   num_sample_steps: 50
 
