@@ -34,8 +34,8 @@ ROOT = Path(__file__).resolve().parent.parent
 # Параметры
 # --------------------------------------------------------------------------- #
 
-ITEMS_PATH  = ROOT / 'data/processed/toys/items.parquet'
-OUT_DIR     = ROOT / 'data/processed/toys'
+ITEMS_PATH  = ROOT / 'data/processed/toys_k15i5/items.parquet'
+OUT_DIR     = ROOT / 'data/processed/toys_k15i5'
 
 MODEL       = 'Qwen/Qwen3-Embedding-0.6B'
 TEXT_COLUMN = 'text'            # text — после чистки; text_raw — как есть
