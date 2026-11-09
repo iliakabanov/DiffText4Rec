@@ -80,7 +80,7 @@ from item_text import META_COLUMNS, TextConfig, build_item_texts, popularity   #
 RAW_REVIEWS = ROOT / 'data/Toys/Toys_and_Games.jsonl'
 RAW_META    = ROOT / 'data/Toys/meta_Toys_and_Games.jsonl'
 CACHE_DIR   = ROOT / 'data/processed/toys_raw'           # кэш ноутбука toys_raw_structure
-OUT_DIR     = ROOT / 'data/processed/toys_k15i5'         # data/processed/toys — прежний 10-core
+OUT_DIR     = ROOT / 'data/processed/toys'
 
 # ('user_id', 'parent_asin', 'timestamp') — убрать только повторы одной и той же записи;
 # ('user_id', 'parent_asin') — ещё и повторные отзывы на товар в другое время (остаётся самый ранний)

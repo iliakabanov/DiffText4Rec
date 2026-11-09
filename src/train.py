@@ -1,7 +1,7 @@
 """
 Обучение любой модели из builders.MODELS — какой именно, сказано в yaml (model_type):
 
-    python src/train.py --config configs/toys/dreamrec.yaml
+    python src/train.py --config configs/toys/sasrec_w5.yaml
     python src/train.py --config configs/atg/dreamrec_text.yaml
 
 Конфиги лежат по датасетам: configs/<dataset>/<модель>.yaml.
@@ -18,9 +18,9 @@ fit():
     - при optimizer.ema_decay — EMA обучаемых весов (класс EMA): валидация, best.pt и тест
       идут по усреднённым весам, а метрики сырых весов пишутся в log_val.csv как raw_*;
     - каждые eval.every_epochs эпох: val loss, метрики, строка в log_val.csv,
-      best.pt (по val NDCG@20) и latest.pt;
+      best.pt (по val-метрике eval.select_metric, по умолчанию NDCG@20) и latest.pt;
     - продолжение с latest.pt, если он есть;
-    - финальный тест на best.pt.
+    - финальный тест на best.pt, если в data_dir есть test_data.df.
 
 Сэмплинг на валидации и тесте засевается EVAL_SEED внутри torch.random.fork_rng:
 метрики воспроизводимы по одному чекпойнту (и совпадают с пересчётом в ноутбуках),
@@ -44,7 +44,7 @@ import random
 import time
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 import numpy as np
 import torch
@@ -52,8 +52,8 @@ import torch.nn as nn
 
 from builders import load_model_config
 from config import TrainConfig
-from data import build_dataloaders
-from evaluate import evaluate
+from data import build_dataloaders, new_item_mask
+from evaluate import evaluate, metric_names
 
 EVAL_SEED = 42
 
@@ -153,9 +153,9 @@ class EMA:
             s.copy_(state['shadow'][name])
 
 
-def _raw_keys(top_k: tuple[int, ...]) -> list[str]:
+def _raw_keys(metric_names: Iterable[str]) -> list[str]:
     """Столбцы log_val.csv с val loss и метриками сырых весов (при EMA)."""
-    return ['raw_val_loss'] + [f'raw_{m}@{k}' for k in top_k for m in ('HR', 'NDCG')]
+    return ['raw_val_loss'] + [f'raw_{name}' for name in metric_names]
 
 
 # --------------------------------------------------------------------------- #
@@ -220,8 +220,8 @@ def save_checkpoint(
 
 
 def _resume(out_dir: Path, model: nn.Module, optimizer, scheduler, ema: EMA | None,
-            device: torch.device) -> tuple[int, int, float]:
-    """Продолжение с latest.pt. Возвращает (эпоха, шаг, лучший val NDCG@20)."""
+            device: torch.device, select_metric: str) -> tuple[int, int, float]:
+    """Продолжение с latest.pt. Возвращает (эпоха, шаг, лучшее значение select_metric на val)."""
     latest = out_dir / 'latest.pt'
     if not latest.exists():
         return 0, 0, 0.0
@@ -249,11 +249,11 @@ def _resume(out_dir: Path, model: nn.Module, optimizer, scheduler, ema: EMA | No
 
     # Лучшую метрику берём из best.pt — иначе первая же валидация перезапишет best.pt
     best = out_dir / 'best.pt'
-    best_ndcg20 = (torch.load(best, map_location='cpu', mmap=True)['metrics'].get('NDCG@20', 0.0)
-                   if best.exists() else 0.0)
+    best_score = (torch.load(best, map_location='cpu', mmap=True)['metrics'].get(select_metric, 0.0)
+                  if best.exists() else 0.0)
     print(f'Resumed from epoch {ckpt["epoch"]}, step {ckpt["step"]}, '
-          f'best val NDCG@20 {best_ndcg20:.4f}')
-    return ckpt['epoch'], ckpt['step'], best_ndcg20
+          f'best val {select_metric} {best_score:.4f}')
+    return ckpt['epoch'], ckpt['step'], best_score
 
 
 # --------------------------------------------------------------------------- #
@@ -282,14 +282,17 @@ def fit(
     build_model: Callable[[TrainConfig], nn.Module],
 ) -> dict[str, float]:
     """
-    Обучает модель по конфигу и возвращает метрики на test.
+    Обучает модель по конфигу и возвращает метрики на test (пустой dict, если test_data.df нет).
 
     Args:
         cfg:         конфиг (см. config.TrainConfig).
         build_model: cfg -> модель; вызывается после set_seed и создания лоадеров.
     """
-    if 20 not in cfg.eval.top_k:
-        raise ValueError(f'eval.top_k={cfg.eval.top_k} должен содержать 20: best.pt выбирается по NDCG@20')
+    select_metric = cfg.eval.select_metric
+    available = metric_names(cfg.eval.top_k, cfg.eval.item_groups)
+    if select_metric not in available:
+        raise ValueError(f'eval.select_metric={select_metric!r} не считается при top_k={list(cfg.eval.top_k)} '
+                         f'и item_groups={cfg.eval.item_groups}; доступны {available}')
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Device: {device}, seed: {cfg.seed}')
@@ -302,17 +305,22 @@ def fit(
     # Данные
     # ------------------------------------------------------------------ #
     d = cfg.data
+    has_test = (Path(d.data_dir) / 'test_data.df').exists()     # у сплита из двух частей (split_temporal) теста нет
     loaders = build_dataloaders(
         data_dir=d.data_dir, batch_size=d.batch_size, num_workers=d.num_workers,
         seq_len=d.max_seq_len, padding_idx=d.padding_idx, seed=cfg.seed,
+        splits=('train', 'val', 'test') if has_test else ('train', 'val'),
     )
     train_loader, val_loader = loaders['train'], loaders['val']
 
     opt = cfg.optimizer
     steps_per_epoch = len(train_loader)
-    print(f'Train: {len(train_loader.dataset):,} | Val: {len(val_loader.dataset):,} | '
-          f'Test: {len(loaders["test"].dataset):,} sequences | '
+    n_test = f'{len(loaders["test"].dataset):,}' if has_test else 'нет'
+    print(f'Train: {len(train_loader.dataset):,} | Val: {len(val_loader.dataset):,} | Test: {n_test} sequences | '
           f'{steps_per_epoch} steps/epoch × {opt.num_epochs} epochs')
+    new_items = new_item_mask(d.data_dir, d.n_items) if cfg.eval.item_groups else None
+    if new_items is not None:
+        print(f'Новых товаров (нет в train): {int(new_items.sum()):,} из {d.n_items:,}')
 
     # ------------------------------------------------------------------ #
     # Модель и оптимизатор
@@ -345,7 +353,7 @@ def fit(
               f'(≈{np.log(2) / (1 - ema.decay) / steps_per_epoch:.1f} эпох)')
     ema_weights = ema.applied if ema is not None else nullcontext
 
-    start_epoch, step, best_ndcg20 = _resume(out_dir, model, optimizer, scheduler, ema, device)
+    start_epoch, step, best_score = _resume(out_dir, model, optimizer, scheduler, ema, device, select_metric)
     if start_epoch >= opt.num_epochs:
         print(f'Обучение уже завершено ({start_epoch}/{opt.num_epochs} эпох) — только финальный тест')
 
@@ -364,7 +372,8 @@ def fit(
         with seeded(EVAL_SEED, device):
             return evaluate(model=model, dataloader=loader, top_k_values=cfg.eval.top_k,
                             num_sample_steps=sample_steps, w_cfg=w_cfg, device=device,
-                            show_progress=True)
+                            show_progress=True, exclude_seen=cfg.eval.exclude_seen,
+                            neighbors_per_sample=cfg.eval.neighbors_per_sample, new_items=new_items)
 
     # ------------------------------------------------------------------ #
     # Обучение
@@ -404,17 +413,17 @@ def fit(
         if ema is not None:
             # Сырые веса — для контроля выигрыша/отставания EMA; сиды сэмплинга те же, сравнение парное
             raw_loss, raw_metrics = run_val_loss(), run_eval(val_loader)
-            raw = dict(zip(_raw_keys(cfg.eval.top_k), [round(raw_loss, 6), *raw_metrics.values()]))
+            raw = dict(zip(_raw_keys(raw_metrics), [round(raw_loss, 6), *raw_metrics.values()]))
             print(f'Raw weights: val loss {raw_loss:.4f} | {raw_metrics}')
 
         ckpt = dict(model=model, epoch=epoch + 1, step=step, model_cfg=model_cfg, ema=ema)
         with ema_weights():
             val_loss = run_val_loss()
             metrics  = run_eval(val_loader)
-            if metrics['NDCG@20'] > best_ndcg20:
-                best_ndcg20 = metrics['NDCG@20']
+            if metrics[select_metric] > best_score:
+                best_score = metrics[select_metric]
                 save_checkpoint(out_dir / 'best.pt', metrics=metrics, **ckpt)
-                print(f'New best NDCG@20: {best_ndcg20:.4f} — saved best.pt')
+                print(f'New best {select_metric}: {best_score:.4f} — saved best.pt')
         model.train()
 
         print(f'Val loss: {val_loss:.4f} | {metrics}' + (' (EMA)' if ema is not None else ''))
@@ -427,6 +436,9 @@ def fit(
     # ------------------------------------------------------------------ #
     # Финальный тест на best.pt
     # ------------------------------------------------------------------ #
+    if not has_test:
+        print(f'\nТеста нет ({d.data_dir}/test_data.df) — финальная оценка пропущена.\nDone.')
+        return {}
     print('\n--- Final evaluation on test set (best.pt) ---')
     best_path = out_dir / 'best.pt'
     if best_path.exists():
@@ -436,7 +448,7 @@ def fit(
 
     print(f'Test: {test_metrics}')
     # Пустые val_loss и raw_*: строка test совпадает по столбцам с заголовком
-    raw_empty = dict.fromkeys(_raw_keys(cfg.eval.top_k), '') if ema is not None else {}
+    raw_empty = dict.fromkeys(_raw_keys(test_metrics), '') if ema is not None else {}
     val_logger.log({'epoch': 'test', 'step': step, 'val_loss': '', **test_metrics, **raw_empty})
     print('\nDone.')
     return test_metrics

@@ -23,7 +23,7 @@ import torch.nn as nn
 import yaml
 
 from config import TextDataConfig, TrainConfig, load_config
-from data import load_item_embeddings, load_sasrec_item_embeddings, shuffle_item_embeddings
+from data import load_item_embeddings, load_sasrec_item_embeddings, new_item_mask, shuffle_item_embeddings
 from models.components import ItemEmbedding
 from models.cosmos import DreamRecCosmos
 from models.dreamrec import DreamRec, DreamRecAlphaFuse, DreamRecFMText, DreamRecText
@@ -66,11 +66,22 @@ class SASRecModelConfig:
     train_prefixes: bool = False  # true — лосс на каждой позиции (оригинальный SASRec) за один forward
     loss_metric: str = 'cosine'   # сходство в лоссе: cosine, dot
     freeze_items: bool = False    # true — эмбеддинги товаров остаются случайными N(0, 0.02), не обучаются
+    target_window: int = 1        # W: сколько следующих товаров правильны; > 1 требует train_prefixes и loss: ce
+    train_items_only: bool = False   # true — в softmax лосса только товары из train (см. SASRec.loss_items)
 
 
 @dataclass
 class SASRecConfig(TrainConfig):
     model: SASRecModelConfig
+
+
+def _loss_items(cfg: TrainConfig):
+    """Маска товаров из train для softmax лосса SASRec при model.train_items_only, иначе None."""
+    if not cfg.model.train_items_only:
+        return None
+    mask = ~new_item_mask(cfg.data.data_dir, cfg.data.n_items)
+    print(f'Softmax лосса — только товары из train: {int(mask.sum()):,} из {cfg.data.n_items:,}')
+    return mask
 
 
 def build_sasrec(cfg: SASRecConfig) -> SASRec:
@@ -92,6 +103,8 @@ def build_sasrec(cfg: SASRecConfig) -> SASRec:
         retrieval_metric=m.retrieval_metric,
         train_prefixes=m.train_prefixes,
         freeze_items=m.freeze_items,
+        target_window=m.target_window,
+        loss_items=_loss_items(cfg),
     )
 
 
@@ -413,6 +426,7 @@ class CosmosModelConfig:
     beta_schedule:    str              # exp, linear, cosine
     retrieval_metric: str              # cosine, dot, l2
     train_prefixes:   bool = False     # true — лосс на каждом префиксе истории за один проход
+    target_window:    int = 1          # W: цель позиции — случайный из следующих W товаров; > 1 требует train_prefixes
     loss:             str = 'mse'      # mse — регрессия процесса; infonce — x̂_0 против таргета и негативов
     loss_metric:      str = 'dot'      # сходство в infonce: dot, cosine
     neg_ratio:        int = 64         # негативов на позитив (infonce)
@@ -475,7 +489,62 @@ def build_cosmos(cfg: CosmosConfig) -> DreamRecCosmos:
         beta_schedule=m.beta_schedule,
         retrieval_metric=m.retrieval_metric,
         train_prefixes=m.train_prefixes,
+        target_window=m.target_window,
         **_loss_kwargs(m),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# SASRecText — SASRec на замороженной таблице товаров, той же, что у DreamRecCosmos
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class SASRecTextModelConfig:
+    items:       CosmosItemsConfig  # как у dreamrec_cosmos, кроме source: learned — для него есть обычный sasrec
+    n_heads:     int
+    n_layers:    int
+    d_ff:        int
+    dropout:     float
+    loss:        str
+    neg_ratio:   int
+    temperature: float
+    retrieval_metric: str         # cosine, dot
+    train_prefixes: bool = False  # true — лосс на каждой позиции за один forward
+    loss_metric: str = 'cosine'   # сходство в лоссе: cosine, dot
+    target_window: int = 1        # W: сколько следующих товаров правильны; > 1 требует train_prefixes и loss: ce
+    train_items_only: bool = False   # true — в softmax лосса только товары из train (см. SASRec.loss_items)
+
+
+@dataclass
+class SASRecTextConfig(TrainConfig):
+    model: SASRecTextModelConfig
+
+
+def build_sasrec_text(cfg: SASRecTextConfig) -> SASRec:
+    """d_model — размерность таблицы товаров (n_components), выход привязан к ней же (tie_weights)."""
+    m = cfg.model
+    if m.items.source == 'learned':
+        raise ValueError("sasrec_text: model.items.source=learned — это обычный sasrec (model_type: sasrec)")
+    items = _cosmos_items(cfg)
+    return SASRec(
+        n_items=cfg.data.n_items,
+        padding_idx=cfg.data.padding_idx,
+        d_model=items.d_emb,
+        n_heads=m.n_heads,
+        n_layers=m.n_layers,
+        d_ff=m.d_ff,
+        dropout=m.dropout,
+        max_seq_len=cfg.data.max_seq_len,
+        tie_weights=True,
+        loss=m.loss,
+        neg_ratio=m.neg_ratio,
+        temperature=m.temperature,
+        loss_metric=m.loss_metric,
+        retrieval_metric=m.retrieval_metric,
+        train_prefixes=m.train_prefixes,
+        items=items,
+        target_window=m.target_window,
+        loss_items=_loss_items(cfg),
     )
 
 
@@ -493,6 +562,7 @@ class ModelSpec:
 MODELS: dict[str, ModelSpec] = {
     'sasrec':             ModelSpec(SASRecConfig,            build_sasrec),
     'sasrec_alphafuse':   ModelSpec(SASRecAlphaFuseConfig,   build_sasrec_alphafuse),
+    'sasrec_text':        ModelSpec(SASRecTextConfig,        build_sasrec_text),
     'dreamrec':           ModelSpec(DreamRecConfig,          build_dreamrec),
     'dreamrec_text':      ModelSpec(DreamRecTextConfig,      build_dreamrec_text),
     'dreamrec_fm_text':   ModelSpec(DreamRecFMTextConfig,    build_dreamrec_fm_text),

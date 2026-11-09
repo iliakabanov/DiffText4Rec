@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.losses import LOSS_METRICS as SASREC_LOSS_METRICS, infonce_loss
+from models.losses import LOSS_METRICS as SASREC_LOSS_METRICS, future_items, infonce_loss
 
 SASREC_RETRIEVAL_METRICS = ('cosine', 'dot')
 
@@ -113,6 +113,8 @@ class SASRec(nn.Module):
         train_prefixes: True — лосс на каждой позиции последовательности (каждая позиция
                      предсказывает следующий товар) за один forward, как в оригинальном SASRec;
                      False — только последняя позиция → next.
+        target_window: W — сколько следующих товаров считается правильными для каждой позиции.
+                     1 — обычный next-item; W > 1 требует train_prefixes и loss='ce'.
         neg_ratio:   число случайных негативов на один позитив (только для 'infonce').
         temperature: температура: логиты лосса = сходство / temperature (оба лосса).
         loss_metric: сходство h и эмбеддингов товаров в лоссе: 'cosine' — L2-нормировка обоих,
@@ -126,6 +128,9 @@ class SASRec(nn.Module):
                      требует tie_weights=True. None — своя таблица item_embedding.
         freeze_items: True — своя таблица item_embedding остаётся случайной инициализацией
                      N(0, 0.02) и не обучается (фиксированные случайные коды товаров).
+        loss_items:  (n_items,) bool — True у товаров, которые участвуют в softmax лосса (обычно — есть в train);
+                     у остальных логит −∞, и обучение их не отталкивает. Действует только в режиме train():
+                     val loss и выдача — по всему каталогу. None — весь каталог. Только для loss='ce'.
     """
 
     def __init__(
@@ -147,8 +152,19 @@ class SASRec(nn.Module):
         train_prefixes: bool = False,
         items: nn.Module | None = None,
         freeze_items: bool = False,
+        target_window: int = 1,
+        loss_items: torch.BoolTensor | None = None,
     ):
         super().__init__()
+        if loss_items is not None:
+            if loss != 'ce':
+                raise ValueError('loss_items (маска товаров в softmax) требует loss=ce')
+            if loss_items.shape != (n_items,):
+                raise ValueError(f'loss_items формы {tuple(loss_items.shape)}, ожидалось ({n_items},)')
+        if target_window < 1:
+            raise ValueError(f'target_window должен быть ≥ 1, получено {target_window}')
+        if target_window > 1 and not (train_prefixes and loss == 'ce'):
+            raise ValueError('target_window > 1 требует train_prefixes=True и loss=ce')
         if freeze_items and items is not None:
             raise ValueError('freeze_items относится к своей таблице item_embedding, а не к внешним items')
         if loss_metric not in SASREC_LOSS_METRICS:
@@ -176,6 +192,9 @@ class SASRec(nn.Module):
         self.retrieval_metric = retrieval_metric
         self.train_prefixes   = train_prefixes
         self.freeze_items     = freeze_items
+        self.target_window    = target_window
+        # Не в state_dict: маска выводится из данных, а старые чекпойнты грузятся строго
+        self.register_buffer('loss_items', loss_items, persistent=False)
 
         # Эмбеддинги товаров: внешний модуль или своя обучаемая таблица.
         # padding_idx обнуляет вектор и запрещает градиент через него.
@@ -289,27 +308,59 @@ class SASRec(nn.Module):
         train_prefixes=True  — позиционный лосс, как в оригинальном SASRec: за один forward
         каждая позиция i предсказывает товар i+1 (последняя — next). Даёт столько же обучающих
         сигналов, сколько разворачивание префиксов в отдельные строки, но без лишних forward.
+
+        target_window > 1 — то же, но правильны следующие W товаров позиции (см. _window_loss).
         """
         if not self.train_prefixes:
             h = self.forward(history, mask)                              # (B, d_model)
             return self._loss(h, target)
 
-        # Таргет позиции i — следующий товар истории, у последней позиции — next
-        labels = torch.cat([history[:, 1:], target[:, None]], dim=1)     # (B, L)
         valid = mask > 0                                                 # padding слева: i реальна → i+1 тоже
         h = self.encode(history, mask)[valid]                            # (N, d_model), N = число реальных позиций
+        if self.target_window > 1:
+            future = future_items(history, target, self.target_window, self.padding_idx)
+            return self._window_loss(h, future[valid])
+
+        # Таргет позиции i — следующий товар истории, у последней позиции — next
+        labels = torch.cat([history[:, 1:], target[:, None]], dim=1)     # (B, L)
         return self._loss(h, labels[valid])
+
+    def _window_loss(self, h: torch.Tensor, future: torch.LongTensor) -> torch.Tensor:
+        """
+        Full-softmax CE по парам (позиция, товар окна): каждый товар окна соревнуется со всем каталогом,
+        кроме остальных товаров своего окна, иначе правильные ответы штрафовались бы как негативы.
+
+            −log(e^s_p / (e^s_p + Σ_{i ∉ окно} e^s_i)) = softplus(logsumexp_{i ∉ окно} s_i − s_p)
+
+        Сумма по негативам считается один раз на позицию, поэтому память — как у обычного CE.
+        Вне autocast-списков logsumexp остался бы в bfloat16, отсюда .float().
+        """
+        logits = self._mask_loss_items(self._ce_logits(h).float() / self.temperature)   # (N, n_items)
+        row, col = (future != self.padding_idx).nonzero(as_tuple=True)
+        items = future[row, col]
+        in_window = torch.zeros_like(logits, dtype=torch.bool)
+        in_window[row, items] = True
+        negatives = logits.masked_fill(in_window, float('-inf')).logsumexp(dim=-1)   # (N,)
+        return F.softplus(negatives[row] - logits[row, items]).mean()
 
     def _loss(self, h: torch.Tensor, target: torch.LongTensor) -> torch.Tensor:
         if self.loss == 'infonce':
             return infonce_loss(h, target, self._embed, self.n_items, self.neg_ratio,
                                 self.loss_metric, self.temperature)
+        return F.cross_entropy(self._mask_loss_items(self._ce_logits(h) / self.temperature), target)
+
+    def _mask_loss_items(self, logits: torch.Tensor) -> torch.Tensor:
+        """На обучении логиты товаров вне loss_items → −∞: они не участвуют в softmax (см. loss_items)."""
+        if self.training and self.loss_items is not None:
+            return logits.masked_fill(~self.loss_items, float('-inf'))
+        return logits
+
+    def _ce_logits(self, h: torch.Tensor) -> torch.Tensor:
+        """(N, d_model) → (N, n_items): сходство loss_metric со всем каталогом, без температуры."""
         if self.loss_metric == 'cosine':
             W = self._item_table() if self.tie_weights else self.output_proj.weight
-            logits = F.normalize(h, dim=-1) @ F.normalize(W, dim=-1).T
-        else:
-            logits = self._logits(h)
-        return F.cross_entropy(logits / self.temperature, target)
+            return F.normalize(h, dim=-1) @ F.normalize(W, dim=-1).T
+        return self._logits(h)
 
     # ------------------------------------------------------------------ #
     # Recommend
@@ -380,6 +431,8 @@ class SASRec(nn.Module):
             'retrieval_metric': self.retrieval_metric,
             'train_prefixes': self.train_prefixes,
             **({'freeze_items': True} if self.freeze_items else {}),
+            **({'target_window': self.target_window} if self.target_window > 1 else {}),
+            **({'loss_items': int(self.loss_items.sum())} if self.loss_items is not None else {}),
             **(self.items.info if self.items is not None else {}),
         }
 

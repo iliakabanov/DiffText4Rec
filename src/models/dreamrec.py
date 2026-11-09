@@ -30,7 +30,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.components import AlphaFuseItemEmbedding, ConcatDenoiser, HistoryEncoder, ItemEmbedding
-from models.losses import LOSS_METRICS, infonce_loss
+from models.losses import LOSS_METRICS, future_items, infonce_loss
 from models.processes import DDPM, FlowMatching
 
 RETRIEVAL_METRICS = ('cosine', 'dot', 'l2')
@@ -59,6 +59,9 @@ class GenerativeRecommender(nn.Module):
         train_prefixes:   True — лосс на каждом префиксе истории за один проход энкодера
                           (каждая позиция предсказывает следующий товар), False — только
                           последняя позиция → target.
+        target_window:    W — цель позиции выбирается случайно из следующих W товаров, заново на каждом
+                          шаге (цель обучения — среднее лосса по окну). 1 — следующий товар;
+                          W > 1 требует train_prefixes.
         loss:             'mse' — регрессия процесса (DDPM: x̂_0 к x_0; FM: к скорости или z_1);
                           'infonce' — предсказание сети x̂_0 из зашумлённого таргета против
                           таргета и neg_ratio случайных негативов (models.losses.infonce_loss).
@@ -81,8 +84,13 @@ class GenerativeRecommender(nn.Module):
         loss_metric: str = 'dot',
         neg_ratio: int = 64,
         temperature: float = 1.0,
+        target_window: int = 1,
     ):
         super().__init__()
+        if target_window < 1:
+            raise ValueError(f'target_window должен быть ≥ 1, получено {target_window}')
+        if target_window > 1 and not train_prefixes:
+            raise ValueError('target_window > 1 требует train_prefixes=True')
         if retrieval_metric not in RETRIEVAL_METRICS:
             raise ValueError(f'retrieval_metric должен быть одним из {RETRIEVAL_METRICS}, получено {retrieval_metric!r}')
         if loss not in LOSSES:
@@ -101,6 +109,7 @@ class GenerativeRecommender(nn.Module):
         self.loss_metric = loss_metric
         self.neg_ratio   = neg_ratio
         self.temperature = temperature
+        self.target_window = target_window
 
     @property
     def d_emb(self) -> int:
@@ -126,11 +135,20 @@ class GenerativeRecommender(nn.Module):
             h = self.denoiser.drop_condition(self.encode_history(history, mask), self.p_uncond)
             return self._loss(h, target)
 
-        labels = torch.cat([history[:, 1:], target[:, None]], dim=1)   # следующий товар для позиции
-        valid = mask > 0                                               # padding слева: i реальна → i+1 тоже
-        h = self.encoder.encode(self.items(history), mask)[valid]      # (N, d_emb)
+        h = self.encoder.encode(self.items(history), mask)[mask > 0]   # (N, d_emb)
         h = self.denoiser.drop_condition(h, self.p_uncond)             # CFG dropout — на каждый префикс
-        return self._loss(h, labels[valid])
+        return self._loss(h, self._prefix_labels(history, target, mask))
+
+    def _prefix_labels(self, history: torch.LongTensor, target: torch.LongTensor,
+                       mask: torch.FloatTensor) -> torch.LongTensor:
+        """(N,): цель каждой реальной позиции. Padding слева: позиция i реальна → всё правее тоже."""
+        valid = mask > 0
+        if self.target_window == 1:
+            return torch.cat([history[:, 1:], target[:, None]], dim=1)[valid]
+        future = future_items(history, target, self.target_window, self.n_items)[valid]   # (N, W)
+        n_left = (future != self.n_items).sum(dim=-1)                  # конец окна может упираться в конец истории
+        pick = (torch.rand(n_left.shape, device=n_left.device) * n_left).long()
+        return future[torch.arange(future.shape[0], device=future.device), pick]
 
     def _loss(self, h: torch.Tensor, target: torch.LongTensor) -> torch.Tensor:
         """h (N, d_emb) — условие, target (N,) — индексы товаров."""
@@ -168,6 +186,7 @@ class GenerativeRecommender(nn.Module):
             'w_cfg': self.w_cfg,
             'retrieval_metric': self.retrieval_metric,
             'train_prefixes': self.train_prefixes,
+            **({'target_window': self.target_window} if self.target_window > 1 else {}),
             'loss': self.loss,
             **({'loss_metric': self.loss_metric, 'neg_ratio': self.neg_ratio,
                 'temperature': self.temperature} if self.loss == 'infonce' else {}),

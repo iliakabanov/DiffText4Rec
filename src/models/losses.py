@@ -12,6 +12,16 @@ import torch.nn.functional as F
 LOSS_METRICS = ('cosine', 'dot')
 
 
+def future_items(history: torch.LongTensor, target: torch.LongTensor, window: int,
+                 padding_idx: int) -> torch.LongTensor:
+    """
+    Следующие window товаров каждой позиции истории: (B, L, window), за концом последовательности —
+    padding_idx. history (B, L) с паддингом слева, target (B,) — товар сразу после истории.
+    """
+    tail = history.new_full((history.shape[0], window - 1), padding_idx)
+    return torch.cat([history[:, 1:], target[:, None], tail], dim=1).unfold(1, window, 1)
+
+
 def infonce_loss(
     query: torch.Tensor,
     target: torch.LongTensor,

@@ -1,0 +1,60 @@
+seed: 42
+model_type: dreamrec_cosmos
+
+data:
+  data_dir: ./data/processed/synthetic_between_oldtest   # тот же train, что у synthetic_between; ответы val — только старые товары
+  padding_idx: 8000        # = item_num из data_statis.df
+  n_items: 8000
+  batch_size: 256          # с train_prefixes строк в батче ×19 (все префиксы истории)
+  num_workers: 4
+  max_seq_len: 20          # = seq_size: история val — 20 товаров
+
+model:
+  items:                   # замороженная таблица ID-SASRec: в ней моды двухмодальных уже слиты (A–B сближены)
+    source: sasrec
+    sasrec_checkpoint: ./checkpoints/synthetic/sasrec_between_oldtest/latest.pt   # сначала обучить sasrec_between_oldtest
+    use_pca: true          # поворот + центрирование + один глобальный std: дисперсия координаты ≈ 1, как у шума
+    n_components: 64       # = d_model SASRec: размерность не сжимается
+    per_component_whitening: false   # whitening по компонентам ломает соседей SASRec-эмбеддингов
+    whitening_cache: ./data/processed/synthetic_between_oldtest/whitening_cache_sasrec.npz   # кэш не сверяется с чекпойнтом: после переобучения SASRec удалить
+
+  # энкодер истории
+  n_heads: 2
+  n_layers: 1
+  d_ff: 256
+  dropout: 0.1
+
+  # денойзер
+  n_blocks: 2
+  denoiser_heads: 4
+  mlp_mult: 4              # d = 64: скрытый слой SwiGLU 256
+  denoiser_dropout: 0.0
+
+  T: 1000
+  beta_schedule: linear
+  retrieval_metric: dot    # как MIPS у SASRec: нормы его эмбеддингов несут информацию
+  train_prefixes: true
+  target_window: 1
+  loss: mse
+
+optimizer:
+  name: adamw
+  lr: 1e-4
+  weight_decay: 0.0
+  grad_clip: 1.0
+  num_epochs: 200          # 78 шагов на эпоху: 15 600 шагов за обучение
+  warmup_epochs: 0
+  ema_decay: null
+
+eval:
+  every_epochs: 20
+  top_k: [50]
+  item_groups: true        # в ответах только старые: _new пустые, NewShare@50 — места, потраченные на новые
+  select_metric: Recall@50_old   # отчитываемся по latest.pt
+  num_sample_steps: 50
+  neighbors_per_sample: 5  # S: @50 — 10 сэмплов, по 5 мест на сэмпл
+  exclude_seen: true       # ответы синтетики не пересекаются с историей по построению
+
+output:
+  dir: ./checkpoints/synthetic
+  run_name: cosmos_sasrec_between_oldtest

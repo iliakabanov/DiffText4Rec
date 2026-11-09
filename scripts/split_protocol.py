@@ -16,7 +16,7 @@ Id товаров те же, что в items.parquet: строки матриц 
 поэтому targets хранит и повторы из seq.
 
     python scripts/split_protocol.py
-    python scripts/split_protocol.py --seed 1 --out data/processed/toys_k15i5_protocol_seed1
+    python scripts/split_protocol.py --seed 1 --out data/processed/toys_protocol_seed1
 """
 import argparse
 import logging

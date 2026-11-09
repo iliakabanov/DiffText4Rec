@@ -4,6 +4,17 @@ Full-rank evaluation для sequential recommendation.
 Метрики: HR@K (Hit Ratio) и NDCG@K (Normalized Discounted Cumulative Gain).
 Оценка по всем товарам каталога (full-rank), не по sampled negatives.
 
+Если в сплите есть колонка targets (протокол scripts/split_protocol.py), правильных ответов у
+пользователя несколько, и метрики считаются по этому множеству F_u; добавляется Recall@K.
+
+При eval.item_groups вместо них считаются только HR@K и Recall@K, отдельно по старым ответам (товар
+был в train) и по новым (не было), и доля новых товаров в выдаче NewShare@K — для временного сплита
+scripts/split_temporal.py (см. group_metrics).
+
+Генеративная модель по умолчанию строит выдачу по одному сэмплу. При eval.neighbors_per_sample = S
+выдача @N собирается из ceil(N / S) сэмплов, у каждого S мест (см. merge_slots): при S = 5 для @20
+это 4 сэмпла, для @50 — 10. Сэмплы общие: @20 использует первые 4 из тех 10.
+
 Full-rank protocol — стандарт в современных работах по seq-rec
 (AlphaFuse, iDreamRec, SASRec). Sampled protocol даёт завышенные
 и несопоставимые числа.
@@ -12,7 +23,7 @@ Full-rank protocol — стандарт в современных работах
 
     python src/evaluate.py --config configs/atg/dreamrec.yaml --n-runs 5
     python src/evaluate.py --config ... --n-runs 3 --seeds 10 --splits test
-    python src/evaluate.py --config configs/toys/sasrec.yaml --checkpoint checkpoints/toys/sasrec_posloss_2/best.pt
+    python src/evaluate.py --config configs/toys/sasrec_w5.yaml --checkpoint checkpoints/toys/sasrec_w5/best.pt
     python src/evaluate.py --self-test
 
 Берутся best.pt прогонов <имя конфига>_1 … <имя конфига>_N из output.dir (так их называет
@@ -92,6 +103,185 @@ def ndcg(rankings: torch.LongTensor, targets: torch.LongTensor, k: int) -> float
     return gains.mean().item()
 
 
+def set_metrics(rankings: torch.LongTensor, targets: torch.LongTensor, k: int) -> dict[str, float]:
+    """
+    HR@K, Recall@K и NDCG@K при нескольких правильных ответах у пользователя.
+
+        HR     — доля пользователей, у которых в top-K есть хотя бы один ответ;
+        Recall — |top-K ∩ F_u| / |F_u|;
+        NDCG   — DCG / IDCG, где IDCG — все min(|F_u|, K) ответов на первых местах.
+
+    Пользователи без ответов в среднее не входят: при exclude_seen все их ответы могли оказаться во входе.
+
+    Args:
+        rankings: (B, top_k), top_k >= k.
+        targets:  (B, T) — индексы ответов, свободные места заполнены -1.
+    """
+    top_k = rankings[:, :k]                                              # (B, k)
+    n_rel = (targets >= 0).sum(dim=-1)                                   # (B,)
+    keep  = n_rel > 0
+    top_k, targets, n_rel = top_k[keep], targets[keep], n_rel[keep]
+
+    hits = (top_k.unsqueeze(-1) == targets.unsqueeze(1)).any(dim=-1)     # (B, k), bool
+    discount = 1.0 / torch.log2(torch.arange(k, device=top_k.device, dtype=torch.float) + 2.0)
+    ideal = discount.cumsum(0)[n_rel.clamp(max=k) - 1]                   # (B,)
+    return {
+        f'HR@{k}':     hits.any(dim=-1).float().mean().item(),
+        f'Recall@{k}': (hits.sum(dim=-1) / n_rel).mean().item(),
+        f'NDCG@{k}':   ((hits.float() * discount).sum(dim=-1) / ideal).mean().item(),
+    }
+
+
+ITEM_GROUPS = ('old', 'new')
+
+
+def group_metrics(rankings: torch.LongTensor, targets: torch.LongTensor, new_items: torch.BoolTensor,
+                  k: int) -> dict[str, float]:
+    """
+    HR@K и Recall@K отдельно по старым ответам (товар был в train) и по новым (не было), плюс NewShare@K —
+    доля новых товаров в top-K по всем пользователям.
+
+    Выдача одна и та же, меняются только ответы: у группы остаются ответы этой группы. Пользователь без
+    ответов группы в её среднее не входит, так что HR@K_new — доля попаданий среди тех, у кого новый ответ есть.
+    _new-метрики читаются вместе с NewShare@K: выдача из одних новых товаров тоже поднимает HR@K_new.
+
+    Args:
+        targets:   (B, T), свободные места -1.
+        new_items: (n_items,) bool — True у товаров, которых нет в train (data.new_item_mask).
+    """
+    real = targets >= 0
+    is_new = new_items[targets.clamp(min=0)] & real
+    metrics: dict[str, float] = {}
+    for group, in_group in zip(ITEM_GROUPS, (real & ~is_new, is_new)):
+        m = set_metrics(rankings, targets.masked_fill(~in_group, -1), k)
+        metrics[f'HR@{k}_{group}'] = m[f'HR@{k}']
+        metrics[f'Recall@{k}_{group}'] = m[f'Recall@{k}']
+    metrics[f'NewShare@{k}'] = new_items[rankings[:, :k]].float().mean().item()
+    return metrics
+
+
+def metric_names(top_k_values: tuple[int, ...], item_groups: bool) -> list[str]:
+    """Имена метрик, которые вернёт evaluate(): по ним проверяется eval.select_metric до обучения."""
+    if item_groups:
+        return [name for k in top_k_values
+                for name in [f'{m}@{k}_{g}' for g in ITEM_GROUPS for m in ('HR', 'Recall')] + [f'NewShare@{k}']]
+    return [f'{m}@{k}' for k in top_k_values for m in ('HR', 'Recall', 'NDCG')]
+
+
+def compute_metrics(rankings: torch.LongTensor, targets: torch.LongTensor,
+                    top_k_values: tuple[int, ...], new_items: torch.BoolTensor | None = None) -> dict[str, float]:
+    """
+    targets (N,) — один ответ на пользователя, (N, T) — множество F_u (см. set_metrics).
+    new_items — вместо общих метрик только HR и Recall по старым и новым товарам (см. group_metrics).
+    """
+    metrics: dict[str, float] = {}
+    for k in top_k_values:
+        if new_items is not None:
+            metrics.update(group_metrics(rankings, targets if targets.dim() == 2 else targets[:, None], new_items, k))
+        elif targets.dim() == 2:
+            metrics.update(set_metrics(rankings, targets, k))
+        else:
+            metrics[f'HR@{k}']   = hit_ratio(rankings, targets, k)
+            metrics[f'NDCG@{k}'] = ndcg(rankings, targets, k)
+    return metrics
+
+
+def drop_seen(rankings: torch.LongTensor, history: torch.LongTensor, k: int) -> torch.LongTensor:
+    """
+    Убирает из выдачи товары входа и оставляет первые k, сохраняя порядок остальных.
+    Выдача должна быть длиннее k на длину окна истории: тогда k непросмотренных товаров найдутся всегда.
+    """
+    seen = (rankings.unsqueeze(-1) == history.unsqueeze(1)).any(dim=-1)  # (B, top_k), bool
+    order = (~seen).float().argsort(dim=-1, descending=True, stable=True)[:, :k]
+    return rankings.gather(1, order)
+
+
+def batch_targets(batch: dict, history: torch.LongTensor, exclude_seen: bool) -> torch.LongTensor:
+    """Ответы батча на устройстве history: (B, T) при колонке targets, иначе (B,)."""
+    if 'targets' not in batch:
+        if exclude_seen:
+            raise ValueError('eval.exclude_seen требует колонку targets: сплит из scripts/split_protocol.py')
+        return batch['target'].to(history.device)
+    targets = batch['targets'].to(history.device)
+    if exclude_seen:
+        seen = (targets.unsqueeze(-1) == history.unsqueeze(1)).any(dim=-1)
+        targets = targets.masked_fill(seen, -1)
+    return targets
+
+
+# --------------------------------------------------------------------------- #
+# Выдача из нескольких сэмплов
+# --------------------------------------------------------------------------- #
+
+def merge_slots(candidates: torch.LongTensor, seen: torch.LongTensor | None, k: int) -> torch.LongTensor:
+    """
+    Выдача из k разных товаров по кругу: первые соседи сэмплов 1, 2, ..., K, затем вторые и так далее.
+    Занятый другим сэмплом или просмотренный товар пропускается, и сэмпл берёт следующего своего соседа,
+    поэтому число мест у сэмплов не зависит от совпадений, а масштаб скоров сэмплов не важен.
+
+    Args:
+        candidates: (K, B, D) — соседи каждого сэмпла по убыванию близости.
+        seen:       (B, L) — товары, которых не должно быть в выдаче; None — таких нет.
+
+    Returns:
+        (B, k)
+    """
+    n_samples, n_users, _ = candidates.shape
+    cand = candidates.tolist()
+    seen_rows = seen.tolist() if seen is not None else [[] for _ in range(n_users)]
+    lists = []
+    for u in range(n_users):
+        taken, cursor, row = set(seen_rows[u]), [0] * n_samples, []
+        while len(row) < k:
+            s = len(row) % n_samples
+            neighbors = cand[s][u]
+            while neighbors[cursor[s]] in taken:
+                cursor[s] += 1
+            taken.add(neighbors[cursor[s]])
+            row.append(neighbors[cursor[s]])
+        lists.append(row)
+    return torch.tensor(lists, dtype=torch.long)
+
+
+def slot_rankings(samples: torch.Tensor, items: torch.Tensor, metric: str, slots: int,
+                  top_k_values: tuple[int, ...], seen: torch.LongTensor | None) -> dict[int, torch.LongTensor]:
+    """
+    Выдача для каждого K из первых ceil(K / slots) сэмплов.
+
+    Сэмпл занимает не больше slots мест и пропускает не больше max(K) + L товаров: столько соседей и запрашивается.
+
+    Args:
+        samples: (n_samples, B, d), n_samples = ceil(max(K) / slots).
+        items:   (N, d) — таблица товаров.
+        seen:    (B, L) или None, см. merge_slots.
+
+    Returns:
+        {K: (B, K)} на CPU.
+    """
+    from models.dreamrec import retrieve        # локально: models тянет за собой whitening
+
+    depth = slots + max(top_k_values) + (seen.shape[1] if seen is not None else 0)
+    candidates = torch.stack([retrieve(s, items, metric, min(depth, items.shape[0])) for s in samples]).cpu()
+    seen = seen.cpu() if seen is not None else None
+    return {k: merge_slots(candidates[:math.ceil(k / slots)], seen, k) for k in top_k_values}
+
+
+def draw_samples(model, history: torch.LongTensor, mask: torch.FloatTensor, n_samples: int,
+                 num_steps: int, w_cfg: float) -> torch.Tensor:
+    """n_samples независимых oracle-эмбеддингов на пользователя: (n_samples, B, d)."""
+    cond = model.encode_history(history, mask)
+    return torch.stack([model.sample(cond, num_steps=num_steps, w_cfg=w_cfg) for _ in range(n_samples)])
+
+
+def _check_slots(model, slots: int | None) -> None:
+    if slots is None:
+        return
+    if slots < 1:
+        raise ValueError(f'eval.neighbors_per_sample должен быть ≥ 1, получено {slots}')
+    if not hasattr(model, 'sample'):
+        raise ValueError(f'eval.neighbors_per_sample требует генеративную модель, а {type(model).__name__} не сэмплирует')
+
+
 # --------------------------------------------------------------------------- #
 # Full-rank evaluation
 # --------------------------------------------------------------------------- #
@@ -105,6 +295,9 @@ def evaluate(
     w_cfg: float = 1.0,
     device: str | torch.device = 'cuda',
     show_progress: bool = True,
+    exclude_seen: bool = False,
+    neighbors_per_sample: int | None = None,
+    new_items: torch.BoolTensor | None = None,
 ) -> dict[str, float]:
     """
     Full-rank evaluation на одном split (val или test).
@@ -112,7 +305,7 @@ def evaluate(
     Для каждого батча:
         1. model.recommend(): история → top-max(K) товаров по всему каталогу
            (у генеративных моделей — через сэмплинг oracle embedding).
-        2. Считаем HR@K и NDCG@K для каждого K.
+        2. Считаем метрики для каждого K (см. compute_metrics).
 
     Args:
         model:            модель с recommend(history, mask, top_k, num_steps, w_cfg)
@@ -123,14 +316,19 @@ def evaluate(
         w_cfg:            сила classifier-free guidance.
         device:           устройство.
         show_progress:    показывать tqdm прогресс-бар.
+        exclude_seen:     убрать товары входа из выдачи и из F_u.
+        neighbors_per_sample: S — выдача @K из ceil(K / S) сэмплов (см. merge_slots); None — один сэмпл.
+        new_items:        (n_items,) bool на CPU — метрики по старым и новым товарам (см. group_metrics).
 
     Returns:
-        dict: {'HR@10': ..., 'NDCG@10': ..., 'HR@20': ..., 'NDCG@20': ...}
+        dict: {'HR@10': ..., 'NDCG@10': ..., 'HR@20': ..., 'NDCG@20': ...}; при targets ещё Recall@K;
+        при new_items — {'HR@K_old', 'Recall@K_old', 'HR@K_new', 'Recall@K_new', 'NewShare@K'}
     """
+    _check_slots(model, neighbors_per_sample)
     model.eval()
     max_k = max(top_k_values)
 
-    all_rankings: list[torch.Tensor] = []
+    all_rankings: dict[int, list[torch.Tensor]] = {k: [] for k in top_k_values}
     all_targets:  list[torch.Tensor] = []
 
     iterator = tqdm(dataloader, desc='Eval', leave=False) if show_progress else dataloader
@@ -138,30 +336,33 @@ def evaluate(
     for batch in iterator:
         history = batch['history'].to(device)   # (B, L)
         mask    = batch['mask'].to(device)      # (B, L)
-        target  = batch['target'].to(device)    # (B,)
 
-        # Генерируем oracle embedding и делаем retrieval
-        rankings = model.recommend(
-            history,
-            mask,
-            top_k=max_k,
-            num_steps=num_sample_steps,
-            w_cfg=w_cfg,
-        )                                       # (B, max_k)
+        if neighbors_per_sample is not None:
+            samples = draw_samples(model, history, mask, math.ceil(max_k / neighbors_per_sample),
+                                   num_sample_steps, w_cfg)
+            rankings = slot_rankings(samples, model.items.table, model.retrieval_metric, neighbors_per_sample,
+                                     top_k_values, history if exclude_seen else None)
+        else:
+            # Генерируем oracle embedding и делаем retrieval
+            single = model.recommend(
+                history,
+                mask,
+                top_k=max_k + history.shape[1] if exclude_seen else max_k,
+                num_steps=num_sample_steps,
+                w_cfg=w_cfg,
+            )                                   # (B, top_k)
+            if exclude_seen:
+                single = drop_seen(single, history, max_k)
+            rankings = dict.fromkeys(top_k_values, single.cpu())
 
-        all_rankings.append(rankings.cpu())
-        all_targets.append(target.cpu())
+        for k in top_k_values:
+            all_rankings[k].append(rankings[k])
+        all_targets.append(batch_targets(batch, history, exclude_seen).cpu())
 
-    # Конкатенируем по всему split'у
-    rankings_all = torch.cat(all_rankings, dim=0)   # (N_total, max_k)
-    targets_all  = torch.cat(all_targets,  dim=0)   # (N_total,)
-
-    # Считаем метрики
-    metrics = {}
+    targets_all = torch.cat(all_targets, dim=0)   # (N_total,) или (N_total, T)
+    metrics: dict[str, float] = {}
     for k in top_k_values:
-        metrics[f'HR@{k}']   = hit_ratio(rankings_all, targets_all, k)
-        metrics[f'NDCG@{k}'] = ndcg(rankings_all, targets_all, k)
-
+        metrics.update(compute_metrics(torch.cat(all_rankings[k], dim=0), targets_all, (k,), new_items))
     return metrics
 
 
@@ -182,6 +383,9 @@ def evaluate_retrievals(
     w_cfg: float = 0.0,
     device: str | torch.device = 'cuda',
     show_progress: bool = False,
+    exclude_seen: bool = False,
+    neighbors_per_sample: int | None = None,
+    new_items: torch.BoolTensor | None = None,
 ) -> dict[str, dict[str, float]]:
     """
     Как evaluate(), но сразу по всем способам ретривала — для одного и того же сэмплинга
@@ -194,41 +398,54 @@ def evaluate_retrievals(
     """
     from models.dreamrec import retrieve        # локально: models тянет за собой whitening
 
+    _check_slots(model, neighbors_per_sample)
     model.eval()
     max_k = max(top_k_values)
     generative = hasattr(model, 'items') and hasattr(model, 'sample')
 
-    rankings: dict[str, list[torch.Tensor]] = {}
+    rankings: dict[str, dict[int, list[torch.Tensor]]] = {}
     targets:  list[torch.Tensor] = []
 
     iterator = tqdm(dataloader, desc='Eval', leave=False) if show_progress else dataloader
     for batch in iterator:
         history = batch['history'].to(device)
         mask    = batch['mask'].to(device)
-        target  = batch['target'].to(device)
+        top_k   = max_k + history.shape[1] if exclude_seen else max_k
 
-        if generative:
+        def single_list(r: torch.Tensor) -> dict[int, torch.Tensor]:
+            r = (drop_seen(r, history, max_k) if exclude_seen else r).cpu()
+            return dict.fromkeys(top_k_values, r)
+
+        if neighbors_per_sample is not None:
+            samples = draw_samples(model, history, mask, math.ceil(max_k / neighbors_per_sample),
+                                   num_sample_steps, w_cfg)
+            batch_rankings = {name: slot_rankings(samples, model.items.table, metric, neighbors_per_sample,
+                                                  top_k_values, history if exclude_seen else None)
+                              for name, metric in RETRIEVAL_ROWS.items()}
+        elif generative:
             oracle = model.sample(model.encode_history(history, mask),
                                   num_steps=num_sample_steps, w_cfg=w_cfg)
-            batch_rankings = {name: retrieve(oracle, model.items.table, metric, max_k)
+            batch_rankings = {name: single_list(retrieve(oracle, model.items.table, metric, top_k))
                               for name, metric in RETRIEVAL_ROWS.items()}
         else:
-            batch_rankings = {type(model).__name__: model.recommend(
-                history, mask, top_k=max_k, num_steps=num_sample_steps, w_cfg=w_cfg)}
+            batch_rankings = {type(model).__name__: single_list(model.recommend(
+                history, mask, top_k=top_k, num_steps=num_sample_steps, w_cfg=w_cfg))}
 
-        batch_rankings['Random'] = torch.stack(
-            [torch.randperm(model.n_items, device=device)[:max_k] for _ in range(target.shape[0])])
+        batch_rankings['Random'] = single_list(torch.stack(
+            [torch.randperm(model.n_items, device=device)[:top_k] for _ in range(history.shape[0])]))
 
-        for name, r in batch_rankings.items():
-            rankings.setdefault(name, []).append(r.cpu())
-        targets.append(target.cpu())
+        for name, by_k in batch_rankings.items():
+            for k, r in by_k.items():
+                rankings.setdefault(name, {}).setdefault(k, []).append(r)
+        targets.append(batch_targets(batch, history, exclude_seen).cpu())
 
     targets_all = torch.cat(targets)
-    return {
-        name: {f'{prefix}@{k}': fn(torch.cat(rs), targets_all, k)
-               for k in top_k_values for prefix, fn in (('HR', hit_ratio), ('NDCG', ndcg))}
-        for name, rs in rankings.items()
-    }
+    results: dict[str, dict[str, float]] = {}
+    for name, by_k in rankings.items():
+        results[name] = {}
+        for k in top_k_values:
+            results[name].update(compute_metrics(torch.cat(by_k[k]), targets_all, (k,), new_items))
+    return results
 
 
 # --------------------------------------------------------------------------- #
@@ -257,7 +474,7 @@ def evaluate_runs(
     """
     # Импорт здесь, а не наверху: train сам импортирует evaluate
     from builders import load_model_config
-    from data import build_dataloaders
+    from data import build_dataloaders, new_item_mask
     from train import seeded
 
     if (n_runs is None) == (checkpoints is None):
@@ -277,6 +494,7 @@ def evaluate_runs(
     loaders = build_dataloaders(cfg.data.data_dir, batch_size=cfg.data.batch_size, num_workers=0,
                                 seq_len=cfg.data.max_seq_len, padding_idx=cfg.data.padding_idx,
                                 splits=splits)
+    new_items = new_item_mask(cfg.data.data_dir, cfg.data.n_items) if cfg.eval.item_groups else None
     seeds = list(range(1, n_seeds + 1))
 
     runs = []
@@ -301,7 +519,10 @@ def evaluate_runs(
                     run = evaluate_retrievals(model, loaders[split], top_k_values=cfg.eval.top_k,
                                               num_sample_steps=cfg.eval.num_sample_steps or 1,
                                               w_cfg=getattr(cfg.model, 'w_cfg', 0.0),
-                                              device=device, show_progress=False)
+                                              device=device, show_progress=False,
+                                              exclude_seen=cfg.eval.exclude_seen,
+                                              neighbors_per_sample=cfg.eval.neighbors_per_sample,
+                                              new_items=new_items)
                 for row, metrics in run.items():
                     for metric, value in metrics.items():
                         results[split].setdefault(row, {}).setdefault(metric, []).append(value)
@@ -313,7 +534,7 @@ def evaluate_runs(
     retrieval_row = (by_metric.get(getattr(cfg.model, 'retrieval_metric', None))
                      if hasattr(model, 'sample') else None)
     return {'model': cfg.model_type, 'runs': runs, 'seeds': seeds, 'retrieval_row': retrieval_row,
-            'results': results}
+            'select_metric': cfg.eval.select_metric, 'results': results}
 
 
 def _t_quantile_975(df: int) -> float:
@@ -355,7 +576,7 @@ def _format_table(rows: dict[str, dict[str, list[float]]]) -> str:
 
 
 def _print_report(report: dict) -> None:
-    seeds, runs = report['seeds'], report['runs']
+    seeds, runs, key = report['seeds'], report['runs'], report['select_metric']
     n_seeds, n_runs = len(seeds), len(runs)
     print(f'\n{report["model"]} | прогонов: {n_runs} — '
           + ', '.join(f'{r["name"]} (эпоха {r["epoch"]})' for r in runs))
@@ -365,23 +586,23 @@ def _print_report(report: dict) -> None:
         print(f'\n=== {split.upper()} === mean ± std по всем запускам ({n_runs} × {n_seeds})')
         print(_format_table(rows))
         row = report.get('retrieval_row') or next(iter(rows))
-        if 'NDCG@20' not in rows[row]:
+        if key not in rows[row]:
             continue
         # Значения идут прогон за прогоном, по n_seeds на прогон
-        values  = rows[row]['NDCG@20']
+        values  = rows[row][key]
         per_run = [_mean_std(values[i * n_seeds:(i + 1) * n_seeds])[0] for i in range(n_runs)]
-        print(f'NDCG@20 ({row}) по прогонам (среднее по сидам): '
+        print(f'{key} ({row}) по прогонам (среднее по сидам): '
               + ', '.join(f'{r["name"]} {m:.4f}' for r, m in zip(runs, per_run)))
         if n_runs > 1:
             # Запуски одного прогона не независимы, поэтому ДИ — по средним прогонов
             mean, std = _mean_std(per_run)
             half = _t_quantile_975(n_runs - 1) * std / math.sqrt(n_runs)
-            print(f'95% ДИ для NDCG@20 ({row}) по средним прогонов: [{mean - half:.4f}, {mean + half:.4f}]')
+            print(f'95% ДИ для {key} ({row}) по средним прогонов: [{mean - half:.4f}, {mean + half:.4f}]')
 
-    saved = [f'{r["name"]} {r["saved_metrics"]["NDCG@20"]:.4f}'
-             for r in runs if 'NDCG@20' in (r['saved_metrics'] or {})]
+    saved = [f'{r["name"]} {r["saved_metrics"][key]:.4f}'
+             for r in runs if key in (r['saved_metrics'] or {})]
     if saved:
-        print('\nДля справки, val NDCG@20 из чекпойнтов (сид тренера 42, ретривал из его конфига): '
+        print(f'\nДля справки, val {key} из чекпойнтов (сид тренера 42, ретривал из его конфига): '
               + ', '.join(saved))
     print('std учитывает и разброс между обучениями, и шум сэмплинга.')
 

@@ -226,9 +226,8 @@ class DreamRecCosmos(GenerativeRecommender):
         """Как в GenerativeRecommender, только условие — токены истории, а не вектор h."""
         if not self.train_prefixes:
             return self._loss(self.encode_history(history, mask), target)
-        labels = torch.cat([history[:, 1:], target[:, None]], dim=1)   # следующий товар для позиции
         seq = self.encoder.encode(self.items(history), mask)
-        return self._loss(prefix_context(seq, mask), labels[mask > 0])
+        return self._loss(prefix_context(seq, mask), self._prefix_labels(history, target, mask))
 
     def config(self) -> dict:
         return {

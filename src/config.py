@@ -5,8 +5,9 @@ Dataclass'ы повторяют секции yaml (seed, model_type, data, model
 в коде параметры читаются как cfg.optimizer.lr, cfg.data.batch_size, cfg.model.T.
 
 Загрузка строгая: лишний ключ, отсутствующий ключ или значение не того типа — сразу
-ошибка с именем файла и путём до ключа. Дефолт есть только у eval.num_sample_steps
-(он нужен лишь генеративным моделям), так что yaml — единственный источник значений.
+ошибка с именем файла и путём до ключа. Дефолты есть только у eval.num_sample_steps и
+eval.neighbors_per_sample (они нужны лишь генеративным моделям), у eval.exclude_seen и eval.item_groups
+(false) и eval.select_metric (NDCG@20) — как в прежних сплитах, так что yaml — единственный источник значений.
 """
 
 from __future__ import annotations
@@ -59,6 +60,10 @@ class EvalConfig:
     every_epochs:     int
     top_k:            tuple[int, ...]
     num_sample_steps: int | None = None   # шагов сэмплинга; SASRec не использует
+    exclude_seen:     bool = False        # true — товары входа убираются из выдачи и из F_u (нужна колонка targets)
+    neighbors_per_sample: int | None = None   # S: мест на сэмпл; для @N считается ceil(N / S) сэмплов; null — один сэмпл
+    item_groups:      bool = False        # true — только HR@K и Recall@K по старым и новым товарам (_old, _new) и NewShare@K
+    select_metric:    str = 'NDCG@20'     # по какой val-метрике выбирается best.pt
 
 
 @dataclass

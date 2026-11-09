@@ -1,0 +1,46 @@
+seed: 42
+model_type: sasrec         # ID-эмбеддинги: новые товары не находит по построению — нижняя планка
+
+data:
+  data_dir: ./data/processed/synthetic_between   # scripts/make_synthetic.py; M на биссектрисе мод: основной датасет
+  padding_idx: 8000        # = item_num из data_statis.df
+  n_items: 8000
+  batch_size: 256
+  num_workers: 4
+  max_seq_len: 20          # = seq_size: история val — 20 товаров
+
+model:
+  d_model: 64
+  n_heads: 2
+  n_layers: 1
+  d_ff: 256
+  dropout: 0.2
+  tie_weights: true
+  loss: ce
+  neg_ratio: 64            # только infonce
+  temperature: 1
+  loss_metric: dot
+  retrieval_metric: dot
+  train_prefixes: true
+  target_window: 1
+  train_items_only: true   # в softmax лосса только товары из train: новые не отталкиваются как негативы
+
+optimizer:
+  name: adam
+  lr: 1e-3
+  weight_decay: 0
+  grad_clip: 1.0
+  num_epochs: 100          # 78 шагов на эпоху: 20 000 пользователей при batch_size 256
+  warmup_epochs: 1
+  ema_decay: null
+
+eval:
+  every_epochs: 10
+  top_k: [50]
+  item_groups: true        # HR и Recall по старым и новым товарам и NewShare@50
+  select_metric: Recall@50_old   # новые ID-модель не находит
+  exclude_seen: true       # ответы синтетики не пересекаются с историей по построению
+
+output:
+  dir: ./checkpoints/synthetic
+  run_name: sasrec_between

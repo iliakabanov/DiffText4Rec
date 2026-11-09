@@ -1,0 +1,60 @@
+seed: 42
+model_type: dreamrec_cosmos
+
+data:
+  data_dir: ./data/processed/toys_temporal   # сплит scripts/split_temporal.py: train до 2023-01-01, val после; F_u — первые 5 после
+  padding_idx: 34922       # = item_num из data_statis.df
+  n_items: 34922
+  batch_size: 256          # с train_prefixes строк в батче ≈ ×20 (все префиксы истории)
+  num_workers: 4
+  max_seq_len: 49          # окно истории; = seq_size из data_statis.df
+
+model:
+  items:
+    source: text           # текст нужен новым товарам: у ID-эмбеддингов их строки не обучены
+    emb_path: ./data/processed/toys/qwen3-embedding-0.6b_text.pickle
+    use_pca: true
+    n_components: 1024      # та же размерность, что у cosmos_sasrec: отличается только пространство товаров
+    per_component_whitening: true    # для Qwen whitening не вредит, в отличие от SASRec
+    whitening_cache: ./data/processed/toys/whitening_cache_qwen.npz   # кэш не проверяет эмбеддинги — свой на каждый источник
+
+  # энкодер истории
+  n_heads: 2
+  n_layers: 1
+  d_ff: 1024
+  dropout: 0.1
+
+  # денойзер
+  n_blocks: 2
+  denoiser_heads: 4
+  mlp_mult: 4              # d = 512: скрытый слой SwiGLU 2048
+  denoiser_dropout: 0.0
+
+  T: 1000
+  beta_schedule: linear    # exp, linear, cosine
+  retrieval_metric: dot    # l2, dot, cosine
+  train_prefixes: true     # лосс на каждом префиксе истории за один проход энкодера
+  target_window: 1         # W: режим next-item
+  loss: mse
+
+optimizer:
+  name: adamw
+  lr: 1e-4                 # на тексте lr 1e-3 уже давал взрыв лосса (старый cosmos_text, 13-я эпоха)
+  weight_decay: 0.0
+  grad_clip: 1.0
+  num_epochs: 100          # 54 шага на эпоху: 13 962 пользователя при batch_size 256
+  warmup_epochs: 0
+  ema_decay: null
+
+eval:
+  every_epochs: 10
+  top_k: [50]
+  item_groups: true        # только HR и Recall, отдельно по старым (были в train) и новым товарам: HR@50_old, ..., Recall@50_new; NewShare@50 — доля новых в выдаче
+  select_metric: Recall@50_new   # best.pt — по новым товарам; отчитываемся всё равно по latest.pt
+  num_sample_steps: 50
+  neighbors_per_sample: 5  # S: мест на сэмпл; @50 — 10 сэмплов; null — один сэмпл
+  exclude_seen: false      # товары входа убираются из выдачи и из F_u
+
+output:
+  dir: ./checkpoints/toys_temporal
+  run_name: cosmos_text_w1

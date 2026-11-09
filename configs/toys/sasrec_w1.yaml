@@ -1,0 +1,43 @@
+seed: 42
+model_type: sasrec
+
+data:
+  data_dir: ./data/processed/toys_protocol   # сплит scripts/split_protocol.py: пользователи 8:1:1, F_u — последние 5 товаров
+  padding_idx: 34922       # = item_num из data_statis.df
+  n_items: 34922
+  batch_size: 256
+  num_workers: 4
+  max_seq_len: 49          # окно истории; = seq_size из data_statis.df, длиннее историй в данных нет
+
+model:
+  d_model: 512
+  n_heads: 2
+  n_layers: 1
+  d_ff: 512
+  dropout: 0.2
+  tie_weights: true
+  loss: ce                 # full softmax по всему каталогу
+  neg_ratio: 64            # только infonce
+  temperature: 1
+  loss_metric: dot         # сходство в лоссе: cosine, dot
+  retrieval_metric: dot    # cosine, dot
+  train_prefixes: true     # лосс на каждой позиции истории за один forward
+  target_window: 1         # W: режим next-item
+
+optimizer:
+  name: adam               # adam — weight_decay как L2 в градиенте; adamw — развязанный decay
+  lr: 1e-4
+  weight_decay: 0
+  grad_clip: 1.0
+  num_epochs: 50          # 44 шага на эпоху: 11 382 пользователя при batch_size 256
+  warmup_epochs: 1
+  ema_decay: null          # null — без EMA; 0.999 — полураспад ≈ 690 шагов
+
+eval:
+  every_epochs: 5
+  top_k: [20, 50]          # best.pt выбирается по NDCG@20
+  exclude_seen: false       # товары входа убираются из выдачи и из F_u
+
+output:
+  dir: ./checkpoints/toys
+  run_name: sasrec_w1

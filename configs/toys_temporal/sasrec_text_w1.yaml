@@ -1,0 +1,52 @@
+seed: 42
+model_type: sasrec_text    # SASRec на той же замороженной таблице товаров, что у cosmos_text_w1
+
+data:
+  data_dir: ./data/processed/toys_temporal   # сплит scripts/split_temporal.py: train до 2023-01-01, val после; F_u — первые 5 после
+  padding_idx: 34922       # = item_num из data_statis.df
+  n_items: 34922
+  batch_size: 256
+  num_workers: 4
+  max_seq_len: 49          # окно истории; = seq_size из data_statis.df, длиннее историй в данных нет
+
+model:
+  items:                   # должно совпадать с cosmos_text_w1: тогда модели различаются только устройством
+    source: text
+    emb_path: ./data/processed/toys/qwen3-embedding-0.6b_text.pickle
+    use_pca: true
+    n_components: 1024      # = d_model
+    per_component_whitening: true
+    whitening_cache: ./data/processed/toys/whitening_cache_qwen.npz   # тот же кэш, что у cosmos_text_w1
+
+  n_heads: 2
+  n_layers: 1
+  d_ff: 512
+  dropout: 0.2
+  loss: ce                 # full softmax по товарам train (train_items_only); выдача — по всему каталогу
+  neg_ratio: 64            # только infonce
+  temperature: 0.05        # логиты в пределах ±20; с dot и τ = 1 они доходили до сотен, softmax вырождался
+  loss_metric: cosine      # таблица заморожена с нормой ≈ √512, а выход LayerNorm — тоже ≈ √512
+  retrieval_metric: cosine # как в лоссе
+  train_prefixes: true     # лосс на каждой позиции истории за один forward
+  target_window: 1         # W: режим next-item
+  train_items_only: true   # новые товары не отталкиваются как негативы: иначе h учится уходить от их областей
+
+optimizer:
+  name: adam               # adam — weight_decay как L2 в градиенте; adamw — развязанный decay
+  lr: 1e-4
+  weight_decay: 0
+  grad_clip: 1.0
+  num_epochs: 200           # 54 шага на эпоху: 13 962 пользователя при batch_size 256
+  warmup_epochs: 1
+  ema_decay: null
+
+eval:
+  every_epochs: 5
+  top_k: [50]
+  item_groups: true        # только HR и Recall, отдельно по старым (были в train) и новым товарам: HR@50_old, ..., Recall@50_new; NewShare@50 — доля новых в выдаче
+  select_metric: Recall@50_new   # best.pt — по новым товарам: ради них модель на тексте
+  exclude_seen: false      # товары входа убираются из выдачи и из F_u
+
+output:
+  dir: ./checkpoints/toys_temporal
+  run_name: sasrec_text_w1

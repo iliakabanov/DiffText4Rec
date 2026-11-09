@@ -5,7 +5,9 @@ Dataset и DataLoader для последовательных рекоменда
 с тремя колонками:
     - seq:     list[int], индексы товаров истории по времени;
     - len_seq: int, число реальных взаимодействий в seq;
-    - next:    int, индекс целевого товара (то, что надо предсказать).
+    - next:    int, индекс целевого товара (то, что надо предсказать);
+    - targets: list[int], необязательная колонка val/test протокола (scripts/split_protocol.py) —
+               множество правильных ответов F_u.
 
 Поддерживаются оба формата seq:
     - без паддинга, переменной длины (scripts/preprocess.py): len_seq = len(seq);
@@ -54,7 +56,8 @@ class ATGDataset(Dataset):
         {
             'history': LongTensor[seq_len]  — индексы товаров (padding слева),
             'target':  LongTensor[]         — индекс целевого товара,
-            'mask':    FloatTensor[seq_len] — 1.0 для реальных позиций, 0.0 для padding.
+            'mask':    FloatTensor[seq_len] — 1.0 для реальных позиций, 0.0 для padding,
+            'targets': LongTensor[T]        — F_u, дополненное -1; только если в файле есть колонка targets.
         }
 
     Padding слева, поэтому реальные взаимодействия — последние min(len_seq, seq_len) позиций,
@@ -89,6 +92,13 @@ class ATGDataset(Dataset):
         threshold = (seq_len - self.len_seq)[:, None]            # (N, 1)
         self.mask = (positions >= threshold).astype(np.float32)  # (N, seq_len)
 
+        self.targets = None
+        if 'targets' in df.columns:
+            sizes = df['targets'].map(len).to_numpy()
+            self.targets = np.full((len(df), sizes.max()), -1, dtype=np.int64)    # (N, T)
+            for i, (items, n) in enumerate(zip(df['targets'], sizes)):
+                self.targets[i, :n] = items
+
     @staticmethod
     def _validate(
         df: pd.DataFrame,
@@ -121,11 +131,14 @@ class ATGDataset(Dataset):
         return self.n
 
     def __getitem__(self, idx: int) -> dict:
-        return {
+        item = {
             'history': torch.from_numpy(self.history[idx]),    # int64 (seq_len,)
             'target':  torch.tensor(self.target[idx], dtype=torch.long),  # int64 scalar
             'mask':    torch.from_numpy(self.mask[idx]),       # float32 (seq_len,)
         }
+        if self.targets is not None:
+            item['targets'] = torch.from_numpy(self.targets[idx])          # int64 (T,)
+        return item
 
 
 # --------------------------------------------------------------------------- #
@@ -209,6 +222,20 @@ def build_dataloaders(
         )
 
     return loaders
+
+
+def new_item_mask(data_dir: str | Path, n_items: int, train_filename: str = 'train_data.df') -> torch.BoolTensor:
+    """
+    (n_items,) bool: True у товаров, которых нет в train — ни в истории, ни в таргете.
+
+    Читается сам файл, а не ATGDataset: окно seq_len могло бы отрезать начало длинных историй.
+    """
+    df = pd.read_pickle(Path(data_dir) / train_filename)
+    seen = np.zeros(n_items, dtype=bool)
+    for seq, n in zip(df['seq'], df['len_seq']):
+        seen[np.asarray(seq, dtype=np.int64)[-n:]] = True
+    seen[df['next'].to_numpy(dtype=np.int64)] = True
+    return torch.from_numpy(~seen)
 
 
 def load_item_embeddings(path: str | Path) -> np.ndarray:

@@ -1,0 +1,58 @@
+seed: 42
+model_type: dreamrec_cosmos
+
+data:
+  data_dir: ./data/processed/toys_protocol   # сплит scripts/split_protocol.py: пользователи 8:1:1, F_u — последние 5 товаров
+  padding_idx: 34922       # = item_num из data_statis.df
+  n_items: 34922
+  batch_size: 256          # с train_prefixes строк в батче ≈ ×24 (все префиксы истории)
+  num_workers: 4
+  max_seq_len: 49          # окно истории; = seq_size из data_statis.df
+
+model:
+  items:
+    source: sasrec         # learned — обучаемые с нуля; text — из emb_path; sasrec — таблица из чекпойнта SASRec
+    sasrec_checkpoint: ./checkpoints/toys/sasrec_w1/best.pt   # обучен только на train-пользователях
+    use_pca: true
+    n_components: 512      # ≤ d_model SASRec
+    per_component_whitening: false   # true раздувает шумовые направления
+    whitening_cache: ./data/processed/toys/whitening_cache_sasrec_w1.npz   # кэш не проверяет эмбеддинги — свой на каждый источник
+
+  # энкодер истории
+  n_heads: 2
+  n_layers: 1
+  d_ff: 1024
+  dropout: 0.1
+
+  # денойзер
+  n_blocks: 2
+  denoiser_heads: 4
+  mlp_mult: 4              # d = 512: скрытый слой SwiGLU 2048
+  denoiser_dropout: 0.0
+
+  T: 1000
+  beta_schedule: linear    # exp, linear, cosine
+  retrieval_metric: dot    # l2, dot, cosine
+  train_prefixes: true     # лосс на каждом префиксе истории за один проход энкодера
+  target_window: 5         # W: цель позиции — случайный из следующих 5 товаров
+  loss: mse
+
+optimizer:
+  name: adamw
+  lr: 1e-3
+  weight_decay: 0.0
+  grad_clip: 1.0
+  num_epochs: 100         # 44 шага на эпоху: 11 382 пользователя при batch_size 256
+  warmup_epochs: 0
+  ema_decay: null
+
+eval:
+  every_epochs: 10
+  top_k: [20, 50]          # best.pt выбирается по NDCG@20
+  num_sample_steps: 50
+  neighbors_per_sample: 5  # S: мест на сэмпл; @20 — 4 сэмпла, @50 — 10; null — один сэмпл
+  exclude_seen: false       # товары входа убираются из выдачи и из F_u
+
+output:
+  dir: ./checkpoints/toys
+  run_name: cosmos_sasrec_w5

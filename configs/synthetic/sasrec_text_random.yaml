@@ -1,0 +1,52 @@
+seed: 42
+model_type: sasrec_text    # один вектор на замороженной таблице генератора
+
+data:
+  data_dir: ./data/processed/synthetic_random   # scripts/make_synthetic.py; M ортогонален всему: где одновекторная модель кладёт массу без помехи
+  padding_idx: 8000        # = item_num из data_statis.df
+  n_items: 8000
+  batch_size: 256
+  num_workers: 4
+  max_seq_len: 20          # = seq_size: история val — 20 товаров
+
+model:
+  items:                   # та же таблица, что у cosmos_random
+    source: text
+    emb_path: ./data/processed/synthetic_random/item_embeddings.pickle   # сфера радиуса √64 = 8
+    use_pca: false         # эмбеддинги генератора как есть
+    n_components: 64       # при use_pca: false не используются, но поля обязательны
+    per_component_whitening: false
+    whitening_cache: ./data/processed/synthetic_random/whitening_unused.npz
+
+  n_heads: 2
+  n_layers: 1
+  d_ff: 256
+  dropout: 0.2
+  loss: ce
+  neg_ratio: 64            # только infonce
+  temperature: 0.25        # нормы товаров равны, поэтому dot = 8·‖h‖·cos: острота пика обучается через ‖h‖;
+  loss_metric: dot         #   τ = 0.25: старт вдвое площе данных (κ = 0.002) при умеренном стартовом лоссе; cosine с фиксированным τ остроты бы не достиг
+  retrieval_metric: dot    # при равных нормах ранжирует как cosine
+  train_prefixes: true
+  target_window: 1
+  train_items_only: true   # в softmax лосса только товары из train: новые не отталкиваются как негативы
+
+optimizer:
+  name: adam
+  lr: 1e-3
+  weight_decay: 0
+  grad_clip: 1.0
+  num_epochs: 100          # 78 шагов на эпоху: 20 000 пользователей при batch_size 256
+  warmup_epochs: 1
+  ema_decay: null
+
+eval:
+  every_epochs: 10
+  top_k: [50]
+  item_groups: true        # HR и Recall по старым и новым товарам и NewShare@50
+  select_metric: Recall@50_new
+  exclude_seen: true       # ответы синтетики не пересекаются с историей по построению
+
+output:
+  dir: ./checkpoints/synthetic
+  run_name: sasrec_text_random
